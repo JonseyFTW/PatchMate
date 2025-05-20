@@ -1,0 +1,25 @@
+services:
+  patching-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: patching-bot:latest
+    container_name: patching-bot
+    ports:
+      - "5000:5000"
+    volumes:
+      - patch_storage:/home/node/.n8n
+      - ./uploads:/app/uploads
+      - ./watch_dir:/data/shared/patching
+    environment:
+      - DEBUG=True
+      - AUTO_START_MONITORING=False
+      - OLLAMA_URL=http://host.docker.internal:11434/api/generate
+      - AI_PROVIDER=ollama
+      - OLLAMA_MODEL=mistral
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  patch_storage:

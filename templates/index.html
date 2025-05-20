@@ -1,0 +1,678 @@
+<!-- templates/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Patching Bot Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
+    <style>
+        .status-indicator {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 5px;
+        }
+        .status-running { background-color: #ffc107; }
+        .status-completed { background-color: #28a745; }
+        .status-failed { background-color: #dc3545; }
+        .status-error { background-color: #6c757d; }
+        model-selector {
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+    
+    #model-selector:hover {
+        border-color: #0d6efd;
+    }
+    
+    #change-model-btn {
+        transition: all 0.2s ease;
+    }
+    
+    #change-model-btn:disabled {
+        opacity: 0.6;
+    }
+    
+    #model-status-badge {
+        font-size: 0.8rem;
+    }
+    
+    #model-change-alert {
+        transition: opacity 0.5s ease;
+    }
+    
+    /* Spinner for loading state */
+    .spinner-border-sm {
+        width: 1rem;
+        height: 1rem;
+        border-width: 0.2em;
+    }
+    
+    /* Add little icons (if using Bootstrap 5 with Bootstrap Icons) */
+    .model-icon {
+        margin-right: 0.5rem;
+    }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container">
+            <a class="navbar-brand" href="/">Patching Bot Dashboard</a>
+        </div>
+    </nav>
+
+    <div class="container mt-4">
+        <div class="row">
+            <div class="col-md-6">
+                <div class="card mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h5 class="mb-0">File Monitoring</h5>
+                        <span id="monitor-status" class="badge bg-secondary">Inactive</span>
+                    </div>
+                    <div class="card-body">
+                        <p>
+                            Monitor Directory: <code id="watch-directory">{{ config.WATCH_DIRECTORY }}</code>
+                        </p>
+                        <div class="d-flex gap-2">
+                            <button id="start-monitoring" class="btn btn-primary">Start Monitoring</button>
+                            <button id="stop-monitoring" class="btn btn-secondary">Stop Monitoring</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="card mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h5 class="mb-0">AI Model Selection</h5>
+                        <span id="model-status-badge" class="badge bg-info">Loading...</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <label for="model-selector" class="form-label">Select Ollama Model:</label>
+                                <select id="model-selector" class="form-select">
+                                    <option value="">Loading models...</option>
+                                </select>
+                                <small class="text-muted">Current model: <span id="current-model">Loading...</span></small>
+                            </div>
+                            <div class="col-md-6 d-flex align-items-end">
+                                <button id="change-model-btn" class="btn btn-primary mt-2">Change Model</button>
+                                <button id="refresh-models-btn" class="btn btn-secondary mt-2 ms-2">
+                                    <i class="bi bi-arrow-clockwise"></i> Refresh
+                                </button>
+                            </div>
+                        </div>
+                        <div id="model-change-alert" class="alert mt-3" style="display: none;"></div>
+                    </div>
+                </div>
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h5 class="mb-0">Manual CSV Upload</h5>
+                    </div>
+                    <div class="card-body">
+                        <form id="upload-form" enctype="multipart/form-data">
+                            <div class="mb-3">
+                                <label for="csvFile" class="form-label">Select CSV file</label>
+                                <input class="form-control" type="file" id="csvFile" accept=".csv">
+                            </div>
+                            <button type="submit" class="btn btn-primary">Process CSV</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-6">
+                <div class="card mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h5 class="mb-0">Active Jobs</h5>
+                        <span id="active-count" class="badge bg-primary">0</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-striped table-sm">
+                                <thead>
+                                    <tr>
+                                        <th>Machine</th>
+                                        <th>Job ID</th>
+                                        <th>Start Time</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="active-jobs-table">
+                                    <!-- Active jobs will be populated here -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0">Completed Jobs</h5>
+                <div>
+                    <span id="completed-count" class="badge bg-success me-2">0</span>
+                    <button id="clear-completed" class="btn btn-sm btn-outline-secondary">Clear</button>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-striped">
+                        <thead>
+                            <tr>
+                                <th>Machine</th>
+                                <th>Job ID</th>
+                                <th>Completion Time</th>
+                                <th>Status</th>
+                                <th>Updates</th>
+                                <th>Failed</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="completed-jobs-table">
+                            <!-- Completed jobs will be populated here -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Job Details Modal -->
+    <div class="modal fade" id="jobDetailsModal" tabindex="-1" aria-labelledby="jobDetailsModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="jobDetailsModalLabel">Job Details</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body" id="job-details-content">
+                    <!-- Job details will be populated here -->
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Debug helper function
+        function logToConsole(message, data) {
+            console.log(`[${new Date().toISOString()}] ${message}`, data);
+        }
+    
+        // Update monitoring status
+        function updateMonitoringStatus(isActive) {
+            const statusBadge = document.getElementById('monitor-status');
+            if (isActive) {
+                statusBadge.textContent = 'Active';
+                statusBadge.className = 'badge bg-success';
+                document.getElementById('start-monitoring').disabled = true;
+                document.getElementById('stop-monitoring').disabled = false;
+            } else {
+                statusBadge.textContent = 'Inactive';
+                statusBadge.className = 'badge bg-secondary';
+                document.getElementById('start-monitoring').disabled = false;
+                document.getElementById('stop-monitoring').disabled = true;
+            }
+        }
+    
+        // Update active jobs table
+        function updateActiveJobsTable(jobs) {
+            const tableBody = document.getElementById('active-jobs-table');
+            tableBody.innerHTML = '';
+            
+            if (!jobs || jobs.length === 0) {
+                document.getElementById('active-count').textContent = '0';
+                return;
+            }
+            
+            document.getElementById('active-count').textContent = jobs.length;
+            logToConsole('Updating active jobs table with', jobs);
+            
+            jobs.forEach(job => {
+                const row = document.createElement('tr');
+                
+                // Machine cell
+                const machineCell = document.createElement('td');
+                machineCell.textContent = job.machine;
+                row.appendChild(machineCell);
+                
+                // Job ID cell
+                const jobIdCell = document.createElement('td');
+                jobIdCell.textContent = job.id.length > 8 ? job.id.substring(0, 8) + '...' : job.id;
+                jobIdCell.title = job.id;
+                row.appendChild(jobIdCell);
+                
+                // Start time cell
+                const startTimeCell = document.createElement('td');
+                try {
+                    startTimeCell.textContent = new Date(job.start_time).toLocaleString();
+                } catch (e) {
+                    startTimeCell.textContent = job.start_time;
+                }
+                row.appendChild(startTimeCell);
+                
+                // Status cell
+                const statusCell = document.createElement('td');
+                const statusIndicator = document.createElement('span');
+                statusIndicator.className = 'status-indicator status-running';
+                statusCell.appendChild(statusIndicator);
+                statusCell.appendChild(document.createTextNode(job.status || 'running'));
+                row.appendChild(statusCell);
+                
+                tableBody.appendChild(row);
+            });
+        }
+    
+        // Update completed jobs table
+        function updateCompletedJobsTable(jobs) {
+            const tableBody = document.getElementById('completed-jobs-table');
+            tableBody.innerHTML = '';
+            
+            if (!jobs || jobs.length === 0) {
+                document.getElementById('completed-count').textContent = '0';
+                return;
+            }
+            
+            document.getElementById('completed-count').textContent = jobs.length;
+            logToConsole('Updating completed jobs table with', jobs);
+            
+            jobs.forEach(job => {
+                const row = document.createElement('tr');
+                
+                // Machine cell
+                const machineCell = document.createElement('td');
+                machineCell.textContent = job.machine || 'Unknown';
+                row.appendChild(machineCell);
+                
+                // Job ID cell
+                const jobIdCell = document.createElement('td');
+                jobIdCell.textContent = job.id.length > 8 ? job.id.substring(0, 8) + '...' : job.id;
+                jobIdCell.title = job.id;
+                row.appendChild(jobIdCell);
+                
+                // Completion time cell
+                const completionTimeCell = document.createElement('td');
+                try {
+                    completionTimeCell.textContent = new Date(job.completion_time).toLocaleString();
+                } catch (e) {
+                    completionTimeCell.textContent = job.completion_time || '';
+                }
+                row.appendChild(completionTimeCell);
+                
+                // Status cell
+                const statusCell = document.createElement('td');
+                const statusIndicator = document.createElement('span');
+                
+                if (job.status === 'completed') {
+                    statusIndicator.className = 'status-indicator status-completed';
+                } else if (job.status === 'error' || job.status === 'failed') {
+                    statusIndicator.className = 'status-indicator status-failed';
+                } else {
+                    statusIndicator.className = 'status-indicator status-error';
+                }
+                
+                statusCell.appendChild(statusIndicator);
+                statusCell.appendChild(document.createTextNode(job.status || 'unknown'));
+                row.appendChild(statusCell);
+                
+                // Updates cell
+                const updatesCell = document.createElement('td');
+                updatesCell.textContent = job.updates || 0;
+                row.appendChild(updatesCell);
+                
+                // Failed cell
+                const failedCell = document.createElement('td');
+                failedCell.textContent = job.failed || 0;
+                if (job.failed > 0) {
+                    failedCell.className = 'text-danger fw-bold';
+                }
+                row.appendChild(failedCell);
+                
+                // Actions cell
+                const actionsCell = document.createElement('td');
+                const viewButton = document.createElement('button');
+                viewButton.textContent = 'View';
+                viewButton.className = 'btn btn-sm btn-outline-primary';
+                viewButton.addEventListener('click', () => showJobDetails(job.id));
+                actionsCell.appendChild(viewButton);
+                row.appendChild(actionsCell);
+                
+                tableBody.appendChild(row);
+            });
+        }
+    
+        // Show job details modal
+        function showJobDetails(jobId) {
+            logToConsole('Showing details for job', jobId);
+            
+            // Find the job in our cached data
+            const job = completedJobsData.find(j => j.id === jobId);
+            
+            if (!job) {
+                alert('Job details not found');
+                return;
+            }
+            
+            const detailsContent = document.getElementById('job-details-content');
+            let content = `
+                <h5>Server: ${job.machine}</h5>
+                <p><strong>Status:</strong> ${job.status}</p>
+                <p><strong>Completion Time:</strong> ${new Date(job.completion_time || '').toLocaleString()}</p>
+            `;
+            
+            if (job.status === 'error' || job.status === 'failed') {
+                content += `<div class="alert alert-danger">${job.error || 'Unknown error'}</div>`;
+            } else if (job.results && job.results.allUpdates) {
+                content += `
+                    <h6>Updates (${job.results.totalUpdates || 0})</h6>
+                    <div class="table-responsive">
+                        <table class="table table-sm">
+                            <thead>
+                                <tr>
+                                    <th>Date</th>
+                                    <th>Status</th>
+                                    <th>Update</th>
+                                    <th>Title</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                `;
+                
+                for (const update of job.results.allUpdates) {
+                    const statusClass = update.status && update.status.includes('Failed') 
+                        ? 'text-danger' 
+                        : 'text-success';
+                    content += `
+                        <tr>
+                            <td>${update.date || ''}</td>
+                            <td class="${statusClass}">${update.status || ''}</td>
+                            <td>${update.update || ''}</td>
+                            <td>${update.title || ''}</td>
+                        </tr>
+                    `;
+                }
+                
+                content += `
+                            </tbody>
+                        </table>
+                    </div>
+                `;
+            }
+            
+            detailsContent.innerHTML = content;
+            
+            const modal = new bootstrap.Modal(document.getElementById('jobDetailsModal'));
+            modal.show();
+        }
+    
+        // Event listeners for buttons
+        document.getElementById('start-monitoring').addEventListener('click', async () => {
+            try {
+                const response = await fetch('/api/start-monitoring', { method: 'POST' });
+                const result = await response.json();
+                
+                if (result.status === 'started' || result.status === 'already_running') {
+                    updateMonitoringStatus(true);
+                } else {
+                    alert(`Failed to start monitoring: ${result.message}`);
+                }
+            } catch (error) {
+                console.error('Error starting monitoring:', error);
+                alert('Error starting monitoring');
+            }
+        });
+    
+        document.getElementById('stop-monitoring').addEventListener('click', async () => {
+            try {
+                const response = await fetch('/api/stop-monitoring', { method: 'POST' });
+                const result = await response.json();
+                
+                if (result.status === 'stopped' || result.status === 'not_running') {
+                    updateMonitoringStatus(false);
+                } else {
+                    alert(`Failed to stop monitoring: ${result.message}`);
+                }
+            } catch (error) {
+                console.error('Error stopping monitoring:', error);
+                alert('Error stopping monitoring');
+            }
+        });
+    
+        document.getElementById('upload-form').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            
+            const fileInput = document.getElementById('csvFile');
+            if (!fileInput.files[0]) {
+                alert('Please select a file');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+            
+            try {
+                const response = await fetch('/api/process-csv', {
+                    method: 'POST',
+                    body: formData,
+                });
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    alert('File processed successfully');
+                    fileInput.value = '';
+                } else {
+                    alert(`Error processing file: ${result.message}`);
+                }
+            } catch (error) {
+                console.error('Error uploading file:', error);
+                alert('Error uploading file');
+            }
+        });
+    
+        document.getElementById('clear-completed').addEventListener('click', async () => {
+            try {
+                const response = await fetch('/api/clear-completed', { method: 'POST' });
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    completedJobsData = [];
+                    updateCompletedJobsTable([]);
+                }
+            } catch (error) {
+                console.error('Error clearing completed jobs:', error);
+                alert('Error clearing completed jobs');
+            }
+        });
+    
+        // Global variables for job data
+        let activeJobsData = [];
+        let completedJobsData = [];
+    
+        // Refresh data from server
+        async function refreshData() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                
+                // Update monitoring status
+                updateMonitoringStatus(data.monitor_active);
+                
+                // Update job data
+                activeJobsData = data.active_jobs_data || [];
+                completedJobsData = data.completed_jobs_data || [];
+                
+                // Update tables
+                updateActiveJobsTable(activeJobsData);
+                updateCompletedJobsTable(completedJobsData);
+                
+                // Log status if there are active jobs
+                if (activeJobsData.length > 0) {
+                    logToConsole('Active jobs:', activeJobsData.length);
+                }
+            } catch (error) {
+                console.error('Error refreshing data:', error);
+            }
+            
+            // Schedule next refresh
+            setTimeout(refreshData, 2000);
+        }
+    
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            logToConsole('Page loaded, initializing dashboard');
+            const monitorActive = {% if monitor_active %}true{% else %}false{% endif %};
+            updateMonitoringStatus(monitorActive);
+            refreshData();
+        });
+    </script>
+    <script>
+        // Function to load available Ollama models
+        function loadOllamaModels() {
+            fetch('/api/ollama-models')
+                .then(response => response.json())
+                .then(data => {
+                    const selector = document.getElementById('model-selector');
+                    const currentModelSpan = document.getElementById('current-model');
+                    const statusBadge = document.getElementById('model-status-badge');
+                    
+                    // Clear existing options
+                    selector.innerHTML = '';
+                    
+                    if (data.status === 'success') {
+                        // Update current model display
+                        currentModelSpan.textContent = data.current_model;
+                        statusBadge.textContent = 'Connected';
+                        statusBadge.className = 'badge bg-success';
+                        
+                        // Add options for each model
+                        if (data.models && data.models.length > 0) {
+                            data.models.forEach(model => {
+                                const option = document.createElement('option');
+                                option.value = model.name;
+                                option.textContent = model.name;
+                                
+                                // Format size in MB or GB
+                                let sizeText = '';
+                                if (model.size) {
+                                    const sizeInMB = model.size / (1024 * 1024);
+                                    if (sizeInMB > 1024) {
+                                        sizeText = ` (${(sizeInMB / 1024).toFixed(1)} GB)`;
+                                    } else {
+                                        sizeText = ` (${sizeInMB.toFixed(0)} MB)`;
+                                    }
+                                }
+                                
+                                option.textContent += sizeText;
+                                
+                                // Pre-select current model
+                                if (model.name === data.current_model) {
+                                    option.selected = true;
+                                }
+                                
+                                selector.appendChild(option);
+                            });
+                        } else {
+                            // No models found
+                            const option = document.createElement('option');
+                            option.value = '';
+                            option.textContent = 'No models available';
+                            selector.appendChild(option);
+                            
+                            statusBadge.textContent = 'No Models';
+                            statusBadge.className = 'badge bg-warning';
+                        }
+                    } else {
+                        // Error loading models
+                        const option = document.createElement('option');
+                        option.value = '';
+                        option.textContent = 'Error loading models';
+                        selector.appendChild(option);
+                        
+                        currentModelSpan.textContent = data.current_model || 'Unknown';
+                        statusBadge.textContent = 'Connection Error';
+                        statusBadge.className = 'badge bg-danger';
+                        
+                        showAlert('error', 'Failed to load models: ' + (data.message || 'Unknown error'));
+                    }
+                })
+                .catch(error => {
+                    console.error('Error fetching models:', error);
+                    
+                    const statusBadge = document.getElementById('model-status-badge');
+                    statusBadge.textContent = 'Connection Error';
+                    statusBadge.className = 'badge bg-danger';
+                    
+                    showAlert('error', 'Failed to connect to server: ' + error.message);
+                });
+        }
+        
+        // Function to change the model
+        function changeModel() {
+            const selector = document.getElementById('model-selector');
+            const selectedModel = selector.value;
+            
+            if (!selectedModel) {
+                showAlert('warning', 'Please select a model');
+                return;
+            }
+            
+            fetch('/api/set-ollama-model', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ model: selectedModel })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    const currentModelSpan = document.getElementById('current-model');
+                    currentModelSpan.textContent = data.current_model;
+                    
+                    showAlert('success', data.message);
+                } else {
+                    showAlert('error', 'Failed to change model: ' + (data.message || 'Unknown error'));
+                }
+            })
+            .catch(error => {
+                console.error('Error changing model:', error);
+                showAlert('error', 'Failed to connect to server: ' + error.message);
+            });
+        }
+        
+        // Helper function to show alerts
+        function showAlert(type, message) {
+            const alertDiv = document.getElementById('model-change-alert');
+            alertDiv.className = 'alert mt-3';
+            alertDiv.className += type === 'success' ? ' alert-success' : 
+                                 type === 'warning' ? ' alert-warning' : ' alert-danger';
+            alertDiv.textContent = message;
+            alertDiv.style.display = 'block';
+            
+            // Auto-hide after 5 seconds
+            setTimeout(() => {
+                alertDiv.style.display = 'none';
+            }, 5000);
+        }
+        
+        // Event listeners
+        document.addEventListener('DOMContentLoaded', function() {
+            // Load models when page loads
+            loadOllamaModels();
+            
+            // Set up event handlers
+            document.getElementById('change-model-btn').addEventListener('click', changeModel);
+            document.getElementById('refresh-models-btn').addEventListener('click', loadOllamaModels);
+        });
+        
+        // Refresh model list periodically (every 5 minutes)
+        setInterval(loadOllamaModels, 5 * 60 * 1000);
+    </script>
+</body>
+</html>
