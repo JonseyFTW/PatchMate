@@ -775,11 +775,12 @@ def generate_ai_report(results_snapshot):
     prompt = "You are a system administrator assistant. Generate a 'Server Patch Status and Health Check Report'.\n"
     prompt += "Adhere strictly to the following section titles and formatting style inspired by the user's example.\n\n"
 
-    prompt += "Executive Summary\n"
+    prompt += "Executive Summary:\n"
+    prompt += "Format the following section with clear metrics:\n"
     prompt += f"- Metric: Total Servers Evaluated, Count: {total_servers_evaluated}\n"
     prompt += f"- Metric: Servers Requiring Attention (due to failed updates), Count: {servers_requiring_attention_count}\n\n"
 
-    prompt += "Detailed Issue Overview\n"
+    prompt += "Detailed Issue Overview:\n"
     if not servers_for_detailed_report:
         prompt += "All servers successfully applied updates. No servers require detailing for failed updates in this section.\n\n"
     else:
@@ -814,7 +815,10 @@ def generate_ai_report(results_snapshot):
                         service_issues_texts.append(f"{svc_name} {s_status.lower()} (Startup Type: {s_start_type})")
             
             arc_details = diagnostics.get("ArcConnectivity", {}).get("Details", "")
-            if "issues" in diagnostics.get("ArcConnectivity", {}).get("Status", "OK").lower():
+            # Standardize GuestConfigAgent reporting as per example
+            if "GuestConfigAgent service not found" in arc_details or "GuestConfigAgent not installed" in arc_details:
+                 service_issues_texts.append("GuestConfigAgent not installed")
+            elif "issues" in diagnostics.get("ArcConnectivity", {}).get("Status", "OK").lower():
                  service_issues_texts.append(f"Azure Arc Connectivity: {arc_details if arc_details else diagnostics.get('ArcConnectivity')['Status']}")
 
 
@@ -826,12 +830,12 @@ def generate_ai_report(results_snapshot):
         prompt += "\n"
 
 
-    prompt += "Actionable Recommendations\n"
+    prompt += "Actionable Recommendations:\n"
     if not servers_for_detailed_report:
         prompt += "No specific recommendations as no servers reported failed updates requiring detailed attention.\n\n"
     else:
         prompt += "Based on the 'Detailed Issue Overview', provide numbered, categorized recommendations. For each, state the 'Immediate Action'.\n"
-        prompt += "Example categories: Failed Update Remediation (specify server), Disk Management (specify server), Pending Reboot Resolution (specify server), Service Management (specify services and startup type changes but if a service is stopped and set to Manual as the start type, ignore since that wouldn't be running constantly anyways. If one is stopped but set to automatic that is an issue), Azure Arc Agent Verification (specify server). We do not use GuestConfigAgent service so don't add that into any checks\n"
+        prompt += "Example categories: Failed Update Remediation (specify server), Disk Management (specify server), Pending Reboot Resolution (specify server), Service Management (specify services, startup type changes), Azure Arc Agent Verification (specify server).\n"
         # Provide hints for recommendations based on the issues found in servers_for_detailed_report
         recommendation_hints = []
         for server_data in servers_for_detailed_report:
@@ -842,7 +846,7 @@ def generate_ai_report(results_snapshot):
         prompt += "Consider these points for recommendations: " + "; ".join(recommendation_hints) + "\n\n"
 
 
-    prompt += "Conclusion\n"
+    prompt += "Conclusion:\n"
     if servers_requiring_attention_count == 0:
         prompt += "All evaluated servers have successfully applied recent patches. "
         any_diag_issues_overall = any(s['_has_diagnostic_issues'] for s in all_server_data_with_flags if not s['_has_failed_updates'])
@@ -855,7 +859,7 @@ def generate_ai_report(results_snapshot):
         prompt += "Comment on the patch status of other servers not detailed (if applicable, e.g., 'Other X servers successfully applied all patches.'). "
         prompt += "Emphasize the need to address the identified problems promptly to ensure operational stability and compliance.\n"
     
-    prompt += "\nIMPORTANT: Ensure the output strictly follows the section titles: 'Executive Summary', 'Detailed Issue Overview', 'Actionable Recommendations', 'Conclusion'. Use formatting (like numbered lists, bullet points, bolding for emphasis)"
+    prompt += "\nIMPORTANT: Ensure the output strictly follows the section titles: 'Executive Summary', 'Detailed Issue Overview', 'Actionable Recommendations', 'Conclusion'. Use formatting (like numbered lists, bullet points, bolding for emphasis) similar to the user's desired image example."
 
     logger.info(f"AI Prompt (length: {len(prompt)} chars). Preview (first 500):\n{prompt[:500]}...")
     
