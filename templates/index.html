@@ -1,678 +1,543 @@
-<!-- templates/index.html -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Patching Bot Dashboard</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
+    <title>PatchMate :: Patching Bot Control</title>
+    <link href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css" rel="stylesheet">
     <style>
-        .status-indicator {
-            width: 16px;
-            height: 16px;
-            border-radius: 50%;
-            display: inline-block;
-            margin-right: 5px;
-        }
-        .status-running { background-color: #ffc107; }
-        .status-completed { background-color: #28a745; }
-        .status-failed { background-color: #dc3545; }
-        .status-error { background-color: #6c757d; }
-        model-selector {
-        cursor: pointer;
-        transition: all 0.2s ease;
-    }
-    
-    #model-selector:hover {
-        border-color: #0d6efd;
-    }
-    
-    #change-model-btn {
-        transition: all 0.2s ease;
-    }
-    
-    #change-model-btn:disabled {
-        opacity: 0.6;
-    }
-    
-    #model-status-badge {
-        font-size: 0.8rem;
-    }
-    
-    #model-change-alert {
-        transition: opacity 0.5s ease;
-    }
-    
-    /* Spinner for loading state */
-    .spinner-border-sm {
-        width: 1rem;
-        height: 1rem;
-        border-width: 0.2em;
-    }
-    
-    /* Add little icons (if using Bootstrap 5 with Bootstrap Icons) */
-    .model-icon {
-        margin-right: 0.5rem;
-    }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; padding-top: 20px; }
+        .container { max-width: 100%; padding-left: 30px; padding-right: 30px; }
+        .header { text-align: center; margin-bottom: 30px; color: #333; }
+        .header h1 { font-weight: 300; }
+        .card { margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .card-header { background-color: #007bff; color: white; font-weight: bold; }
+        .btn-custom { margin: 5px; }
+        #statusArea, #logArea { margin-top: 20px; }
+        .job-list { list-style-type: none; padding-left: 0; }
+        .job-list li { padding: 8px; border-bottom: 1px solid #eee; }
+        .job-list li:last-child { border-bottom: none; }
+        .job-status-running { color: #007bff; }
+        .job-status-completed { color: #28a745; }
+        .job-status-failed, .job-status-error { color: #dc3545; }
+        .log-entry { font-family: 'Courier New', Courier, monospace; font-size: 0.9em; white-space: pre-wrap; word-wrap: break-word; }
+        .timestamp { color: #888; margin-right: 10px; }
+        .table-responsive { max-height: 400px; overflow-y: auto; }
+        .nav-tabs .nav-link.active { background-color: #007bff; color: white; }
+        .nav-tabs .nav-link { color: #0056b3; }
+        #aiModelControls select, #aiProviderSelect { margin-bottom: 10px; } /* Added #aiProviderSelect */
+        .config-value { font-weight: normal; color: #555; }
+        .spinner-border-sm { width: 1rem; height: 1rem; border-width: .2em; }
     </style>
 </head>
 <body>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
-        <div class="container">
-            <a class="navbar-brand" href="/">Patching Bot Dashboard</a>
+    <div class="container">
+        <div class="header">
+            <h1><i class="fas fa-cogs"></i> PatchMate Control Panel</h1>
+            <p class="lead">Manage and Monitor Windows Patching Automation</p>
         </div>
-    </nav>
 
-    <div class="container mt-4">
-        <div class="row">
-            <div class="col-md-6">
-                <div class="card mb-4">
-                    <div class="card-header d-flex justify-content-between align-items-center">
-                        <h5 class="mb-0">File Monitoring</h5>
-                        <span id="monitor-status" class="badge bg-secondary">Inactive</span>
+        <div class="card">
+            <div class="card-header"><i class="fas fa-tachometer-alt"></i> System Control & Status</div>
+            <div class="card-body">
+                <button id="startMonitoringBtn" class="btn btn-success btn-custom"><i class="fas fa-play-circle"></i> Start File Monitoring</button>
+                <button id="stopMonitoringBtn" class="btn btn-warning btn-custom"><i class="fas fa-stop-circle"></i> Stop File Monitoring</button>
+                <button id="refreshStatusBtn" class="btn btn-info btn-custom"><i class="fas fa-sync-alt"></i> Refresh Status</button>
+                <button id="clearTransientDataBtn" class="btn btn-secondary btn-custom"><i class="fas fa-eraser"></i> Clear Completed/Session Data</button>
+                <button id="resetStateBtn" class="btn btn-danger btn-custom"><i class="fas fa-power-off"></i> Reset Full Application State</button>
+                <hr>
+                <p><strong>File Monitoring Status:</strong> <span id="monitorStatus" class="badge badge-secondary">Unknown</span></p>
+                <p><strong>Active AI Provider:</strong> <span id="activeAiProviderDisplay" class="badge badge-info">{{ current_ai_provider_from_config | upper }}</span></p>
+                <div id="statusMessage" class="mt-2"></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header"><i class="fas fa-upload"></i> Manual File Upload for Processing</div>
+            <div class="card-body">
+                <form id="uploadForm" enctype="multipart/form-data">
+                    <div class="form-group">
+                        <label for="fileInput">Upload CSV or Excel file with machine names:</label>
+                        <input type="file" class="form-control-file" id="fileInput" name="file" accept=".csv, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/vnd.ms-excel">
                     </div>
-                    <div class="card-body">
-                        <p>
-                            Monitor Directory: <code id="watch-directory">{{ config.WATCH_DIRECTORY }}</code>
-                        </p>
-                        <div class="d-flex gap-2">
-                            <button id="start-monitoring" class="btn btn-primary">Start Monitoring</button>
-                            <button id="stop-monitoring" class="btn btn-secondary">Stop Monitoring</button>
-                        </div>
-                    </div>
+                    <button type="submit" class="btn btn-primary btn-custom"><i class="fas fa-cogs"></i> Process File</button>
+                </form>
+                <div id="uploadStatus" class="mt-2"></div>
+            </div>
+        </div>
+        
+        <div class="card" id="aiConfigCard">
+            <div class="card-header"><i class="fas fa-brain"></i> AI Configuration</div>
+            <div class="card-body">
+                <div class="form-group">
+                    <label for="aiProviderSelect">Select AI Provider:</label>
+                    <select id="aiProviderSelect" class="form-control">
+                        <option value="ollama" {% if current_ai_provider_from_config == 'ollama' %}selected{% endif %}>Ollama</option>
+                        <option value="vllm" {% if current_ai_provider_from_config == 'vllm' %}selected{% endif %}>VLLM</option>
+                        <option value="openai" {% if current_ai_provider_from_config == 'openai' %}selected{% endif %}>OpenAI</option>
+                        <option value="template" {% if current_ai_provider_from_config == 'template' %}selected{% endif %}>Template (No AI)</option>
+                    </select>
                 </div>
-                <div class="card mb-4">
-                    <div class="card-header d-flex justify-content-between align-items-center">
-                        <h5 class="mb-0">AI Model Selection</h5>
-                        <span id="model-status-badge" class="badge bg-info">Loading...</span>
+                <button id="setAiProviderBtn" class="btn btn-info btn-custom mb-3"><i class="fas fa-exchange-alt"></i> Set Provider for Session</button>
+                <div id="aiProviderStatus" class="mb-3"></div>
+
+                <hr>
+                <div id="aiModelControls">
+                    <p><strong>Current Model for <span id="selectedProviderForModelLabel">{{ current_ai_provider_from_config | upper }}</span>:</strong> <span id="currentAiModel" class="badge badge-light">Loading...</span></p>
+                    <div class="form-group">
+                        <label for="aiModelSelect">Select Model:</label>
+                        <select id="aiModelSelect" class="form-control"></select>
                     </div>
-                    <div class="card-body">
-                        <div class="row">
-                            <div class="col-md-6">
-                                <label for="model-selector" class="form-label">Select Ollama Model:</label>
-                                <select id="model-selector" class="form-select">
-                                    <option value="">Loading models...</option>
-                                </select>
-                                <small class="text-muted">Current model: <span id="current-model">Loading...</span></small>
-                            </div>
-                            <div class="col-md-6 d-flex align-items-end">
-                                <button id="change-model-btn" class="btn btn-primary mt-2">Change Model</button>
-                                <button id="refresh-models-btn" class="btn btn-secondary mt-2 ms-2">
-                                    <i class="bi bi-arrow-clockwise"></i> Refresh
-                                </button>
-                            </div>
-                        </div>
-                        <div id="model-change-alert" class="alert mt-3" style="display: none;"></div>
-                    </div>
+                    <button id="setAiModelBtn" class="btn btn-primary btn-custom"><i class="fas fa-save"></i> Set Model for Session</button>
+                    <div id="aiModelStatus" class="mt-2"></div>
                 </div>
-                <div class="card mb-4">
-                    <div class="card-header">
-                        <h5 class="mb-0">Manual CSV Upload</h5>
-                    </div>
-                    <div class="card-body">
-                        <form id="upload-form" enctype="multipart/form-data">
-                            <div class="mb-3">
-                                <label for="csvFile" class="form-label">Select CSV file</label>
-                                <input class="form-control" type="file" id="csvFile" accept=".csv">
-                            </div>
-                            <button type="submit" class="btn btn-primary">Process CSV</button>
-                        </form>
-                    </div>
+                <div id="aiModelLoading" style="display:none;">
+                    <p><i class="fas fa-spinner fa-spin"></i> Loading model information...</p>
+                </div>
+                 <div id="aiModelNotSupported" style="display:none;">
+                    <p>Model selection is not applicable or not configured for the current AI provider (<span id="unsupportedProviderName"></span>).</p>
                 </div>
             </div>
+        </div>
 
-            <div class="col-md-6">
-                <div class="card mb-4">
-                    <div class="card-header d-flex justify-content-between align-items-center">
-                        <h5 class="mb-0">Active Jobs</h5>
-                        <span id="active-count" class="badge bg-primary">0</span>
-                    </div>
-                    <div class="card-body">
+        <div class="card">
+            <div class="card-header">
+                <ul class="nav nav-tabs card-header-tabs">
+                    <li class="nav-item">
+                        <a class="nav-link active" id="active-jobs-tab" data-toggle="tab" href="#activeJobsContent" role="tab" aria-controls="activeJobsContent" aria-selected="true"><i class="fas fa-tasks"></i> Active Jobs (<span id="activeJobsCount">0</span>)</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" id="completed-jobs-tab" data-toggle="tab" href="#completedJobsContent" role="tab" aria-controls="completedJobsContent" aria-selected="false"><i class="fas fa-check-circle"></i> Completed Jobs (<span id="completedJobsCount">0</span>)</a>
+                    </li>
+                     <li class="nav-item">
+                        <a class="nav-link" id="system-info-tab" data-toggle="tab" href="#systemInfoContent" role="tab" aria-controls="systemInfoContent" aria-selected="false"><i class="fas fa-info-circle"></i> System Info</a>
+                    </li>
+                </ul>
+            </div>
+            <div class="card-body">
+                <div class="tab-content" id="jobsTabContent">
+                    <div class="tab-pane fade show active" id="activeJobsContent" role="tabpanel" aria-labelledby="active-jobs-tab">
+                        <h5>Active Patching Jobs</h5>
                         <div class="table-responsive">
-                            <table class="table table-striped table-sm">
-                                <thead>
-                                    <tr>
-                                        <th>Machine</th>
-                                        <th>Job ID</th>
-                                        <th>Start Time</th>
-                                        <th>Status</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="active-jobs-table">
-                                    <!-- Active jobs will be populated here -->
+                            <table class="table table-sm table-striped">
+                                <thead><tr><th>Job ID</th><th>Machine</th><th>Start Time</th><th>Status</th></tr></thead>
+                                <tbody id="activeJobsList">
+                                    <tr><td colspan="4" class="text-center">No active jobs.</td></tr>
                                 </tbody>
                             </table>
                         </div>
                     </div>
-                </div>
-            </div>
-        </div>
-
-        <div class="card mb-4">
-            <div class="card-header d-flex justify-content-between align-items-center">
-                <h5 class="mb-0">Completed Jobs</h5>
-                <div>
-                    <span id="completed-count" class="badge bg-success me-2">0</span>
-                    <button id="clear-completed" class="btn btn-sm btn-outline-secondary">Clear</button>
-                </div>
-            </div>
-            <div class="card-body">
-                <div class="table-responsive">
-                    <table class="table table-striped">
-                        <thead>
-                            <tr>
-                                <th>Machine</th>
-                                <th>Job ID</th>
-                                <th>Completion Time</th>
-                                <th>Status</th>
-                                <th>Updates</th>
-                                <th>Failed</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="completed-jobs-table">
-                            <!-- Completed jobs will be populated here -->
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Job Details Modal -->
-    <div class="modal fade" id="jobDetailsModal" tabindex="-1" aria-labelledby="jobDetailsModalLabel" aria-hidden="true">
-        <div class="modal-dialog modal-lg">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h5 class="modal-title" id="jobDetailsModalLabel">Job Details</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-                </div>
-                <div class="modal-body" id="job-details-content">
-                    <!-- Job details will be populated here -->
-                </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js"></script>
-    <script>
-        // Debug helper function
-        function logToConsole(message, data) {
-            console.log(`[${new Date().toISOString()}] ${message}`, data);
-        }
-    
-        // Update monitoring status
-        function updateMonitoringStatus(isActive) {
-            const statusBadge = document.getElementById('monitor-status');
-            if (isActive) {
-                statusBadge.textContent = 'Active';
-                statusBadge.className = 'badge bg-success';
-                document.getElementById('start-monitoring').disabled = true;
-                document.getElementById('stop-monitoring').disabled = false;
-            } else {
-                statusBadge.textContent = 'Inactive';
-                statusBadge.className = 'badge bg-secondary';
-                document.getElementById('start-monitoring').disabled = false;
-                document.getElementById('stop-monitoring').disabled = true;
-            }
-        }
-    
-        // Update active jobs table
-        function updateActiveJobsTable(jobs) {
-            const tableBody = document.getElementById('active-jobs-table');
-            tableBody.innerHTML = '';
-            
-            if (!jobs || jobs.length === 0) {
-                document.getElementById('active-count').textContent = '0';
-                return;
-            }
-            
-            document.getElementById('active-count').textContent = jobs.length;
-            logToConsole('Updating active jobs table with', jobs);
-            
-            jobs.forEach(job => {
-                const row = document.createElement('tr');
-                
-                // Machine cell
-                const machineCell = document.createElement('td');
-                machineCell.textContent = job.machine;
-                row.appendChild(machineCell);
-                
-                // Job ID cell
-                const jobIdCell = document.createElement('td');
-                jobIdCell.textContent = job.id.length > 8 ? job.id.substring(0, 8) + '...' : job.id;
-                jobIdCell.title = job.id;
-                row.appendChild(jobIdCell);
-                
-                // Start time cell
-                const startTimeCell = document.createElement('td');
-                try {
-                    startTimeCell.textContent = new Date(job.start_time).toLocaleString();
-                } catch (e) {
-                    startTimeCell.textContent = job.start_time;
-                }
-                row.appendChild(startTimeCell);
-                
-                // Status cell
-                const statusCell = document.createElement('td');
-                const statusIndicator = document.createElement('span');
-                statusIndicator.className = 'status-indicator status-running';
-                statusCell.appendChild(statusIndicator);
-                statusCell.appendChild(document.createTextNode(job.status || 'running'));
-                row.appendChild(statusCell);
-                
-                tableBody.appendChild(row);
-            });
-        }
-    
-        // Update completed jobs table
-        function updateCompletedJobsTable(jobs) {
-            const tableBody = document.getElementById('completed-jobs-table');
-            tableBody.innerHTML = '';
-            
-            if (!jobs || jobs.length === 0) {
-                document.getElementById('completed-count').textContent = '0';
-                return;
-            }
-            
-            document.getElementById('completed-count').textContent = jobs.length;
-            logToConsole('Updating completed jobs table with', jobs);
-            
-            jobs.forEach(job => {
-                const row = document.createElement('tr');
-                
-                // Machine cell
-                const machineCell = document.createElement('td');
-                machineCell.textContent = job.machine || 'Unknown';
-                row.appendChild(machineCell);
-                
-                // Job ID cell
-                const jobIdCell = document.createElement('td');
-                jobIdCell.textContent = job.id.length > 8 ? job.id.substring(0, 8) + '...' : job.id;
-                jobIdCell.title = job.id;
-                row.appendChild(jobIdCell);
-                
-                // Completion time cell
-                const completionTimeCell = document.createElement('td');
-                try {
-                    completionTimeCell.textContent = new Date(job.completion_time).toLocaleString();
-                } catch (e) {
-                    completionTimeCell.textContent = job.completion_time || '';
-                }
-                row.appendChild(completionTimeCell);
-                
-                // Status cell
-                const statusCell = document.createElement('td');
-                const statusIndicator = document.createElement('span');
-                
-                if (job.status === 'completed') {
-                    statusIndicator.className = 'status-indicator status-completed';
-                } else if (job.status === 'error' || job.status === 'failed') {
-                    statusIndicator.className = 'status-indicator status-failed';
-                } else {
-                    statusIndicator.className = 'status-indicator status-error';
-                }
-                
-                statusCell.appendChild(statusIndicator);
-                statusCell.appendChild(document.createTextNode(job.status || 'unknown'));
-                row.appendChild(statusCell);
-                
-                // Updates cell
-                const updatesCell = document.createElement('td');
-                updatesCell.textContent = job.updates || 0;
-                row.appendChild(updatesCell);
-                
-                // Failed cell
-                const failedCell = document.createElement('td');
-                failedCell.textContent = job.failed || 0;
-                if (job.failed > 0) {
-                    failedCell.className = 'text-danger fw-bold';
-                }
-                row.appendChild(failedCell);
-                
-                // Actions cell
-                const actionsCell = document.createElement('td');
-                const viewButton = document.createElement('button');
-                viewButton.textContent = 'View';
-                viewButton.className = 'btn btn-sm btn-outline-primary';
-                viewButton.addEventListener('click', () => showJobDetails(job.id));
-                actionsCell.appendChild(viewButton);
-                row.appendChild(actionsCell);
-                
-                tableBody.appendChild(row);
-            });
-        }
-    
-        // Show job details modal
-        function showJobDetails(jobId) {
-            logToConsole('Showing details for job', jobId);
-            
-            // Find the job in our cached data
-            const job = completedJobsData.find(j => j.id === jobId);
-            
-            if (!job) {
-                alert('Job details not found');
-                return;
-            }
-            
-            const detailsContent = document.getElementById('job-details-content');
-            let content = `
-                <h5>Server: ${job.machine}</h5>
-                <p><strong>Status:</strong> ${job.status}</p>
-                <p><strong>Completion Time:</strong> ${new Date(job.completion_time || '').toLocaleString()}</p>
-            `;
-            
-            if (job.status === 'error' || job.status === 'failed') {
-                content += `<div class="alert alert-danger">${job.error || 'Unknown error'}</div>`;
-            } else if (job.results && job.results.allUpdates) {
-                content += `
-                    <h6>Updates (${job.results.totalUpdates || 0})</h6>
-                    <div class="table-responsive">
-                        <table class="table table-sm">
-                            <thead>
-                                <tr>
-                                    <th>Date</th>
-                                    <th>Status</th>
-                                    <th>Update</th>
-                                    <th>Title</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                `;
-                
-                for (const update of job.results.allUpdates) {
-                    const statusClass = update.status && update.status.includes('Failed') 
-                        ? 'text-danger' 
-                        : 'text-success';
-                    content += `
-                        <tr>
-                            <td>${update.date || ''}</td>
-                            <td class="${statusClass}">${update.status || ''}</td>
-                            <td>${update.update || ''}</td>
-                            <td>${update.title || ''}</td>
-                        </tr>
-                    `;
-                }
-                
-                content += `
-                            </tbody>
-                        </table>
+                    <div class="tab-pane fade" id="completedJobsContent" role="tabpanel" aria-labelledby="completed-jobs-tab">
+                        <h5>Completed/Failed Patching Jobs</h5>
+                        <div class="table-responsive">
+                            <table class="table table-sm table-hover">
+                                <thead><tr><th>Job ID</th><th>Machine</th><th>Completion Time</th><th>Status</th><th>Updates</th><th>Failed</th><th>Details</th></tr></thead>
+                                <tbody id="completedJobsList">
+                                     <tr><td colspan="7" class="text-center">No completed jobs yet.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
-                `;
-            }
-            
-            detailsContent.innerHTML = content;
-            
-            const modal = new bootstrap.Modal(document.getElementById('jobDetailsModal'));
-            modal.show();
-        }
-    
-        // Event listeners for buttons
-        document.getElementById('start-monitoring').addEventListener('click', async () => {
-            try {
-                const response = await fetch('/api/start-monitoring', { method: 'POST' });
-                const result = await response.json();
-                
-                if (result.status === 'started' || result.status === 'already_running') {
-                    updateMonitoringStatus(true);
-                } else {
-                    alert(`Failed to start monitoring: ${result.message}`);
-                }
-            } catch (error) {
-                console.error('Error starting monitoring:', error);
-                alert('Error starting monitoring');
-            }
-        });
-    
-        document.getElementById('stop-monitoring').addEventListener('click', async () => {
-            try {
-                const response = await fetch('/api/stop-monitoring', { method: 'POST' });
-                const result = await response.json();
-                
-                if (result.status === 'stopped' || result.status === 'not_running') {
-                    updateMonitoringStatus(false);
-                } else {
-                    alert(`Failed to stop monitoring: ${result.message}`);
-                }
-            } catch (error) {
-                console.error('Error stopping monitoring:', error);
-                alert('Error stopping monitoring');
-            }
-        });
-    
-        document.getElementById('upload-form').addEventListener('submit', async (event) => {
-            event.preventDefault();
-            
-            const fileInput = document.getElementById('csvFile');
-            if (!fileInput.files[0]) {
-                alert('Please select a file');
-                return;
-            }
-            
-            const formData = new FormData();
-            formData.append('file', fileInput.files[0]);
-            
-            try {
-                const response = await fetch('/api/process-csv', {
-                    method: 'POST',
-                    body: formData,
-                });
-                const result = await response.json();
-                
-                if (result.status === 'success') {
-                    alert('File processed successfully');
-                    fileInput.value = '';
-                } else {
-                    alert(`Error processing file: ${result.message}`);
-                }
-            } catch (error) {
-                console.error('Error uploading file:', error);
-                alert('Error uploading file');
-            }
-        });
-    
-        document.getElementById('clear-completed').addEventListener('click', async () => {
-            try {
-                const response = await fetch('/api/clear-completed', { method: 'POST' });
-                const result = await response.json();
-                
-                if (result.status === 'success') {
-                    completedJobsData = [];
-                    updateCompletedJobsTable([]);
-                }
-            } catch (error) {
-                console.error('Error clearing completed jobs:', error);
-                alert('Error clearing completed jobs');
-            }
-        });
-    
-        // Global variables for job data
-        let activeJobsData = [];
-        let completedJobsData = [];
-    
-        // Refresh data from server
-        async function refreshData() {
-            try {
-                const response = await fetch('/api/status');
-                const data = await response.json();
-                
-                // Update monitoring status
-                updateMonitoringStatus(data.monitor_active);
-                
-                // Update job data
-                activeJobsData = data.active_jobs_data || [];
-                completedJobsData = data.completed_jobs_data || [];
-                
-                // Update tables
-                updateActiveJobsTable(activeJobsData);
-                updateCompletedJobsTable(completedJobsData);
-                
-                // Log status if there are active jobs
-                if (activeJobsData.length > 0) {
-                    logToConsole('Active jobs:', activeJobsData.length);
-                }
-            } catch (error) {
-                console.error('Error refreshing data:', error);
-            }
-            
-            // Schedule next refresh
-            setTimeout(refreshData, 2000);
-        }
-    
-        // Initialize on page load
-        document.addEventListener('DOMContentLoaded', () => {
-            logToConsole('Page loaded, initializing dashboard');
-            const monitorActive = {% if monitor_active %}true{% else %}false{% endif %};
-            updateMonitoringStatus(monitorActive);
-            refreshData();
-        });
-    </script>
+                    <div class="tab-pane fade" id="systemInfoContent" role="tabpanel" aria-labelledby="system-info-tab">
+                        <h5>System Information</h5>
+                        <button id="refreshSystemInfoBtn" class="btn btn-sm btn-outline-info mb-2"><i class="fas fa-sync"></i> Refresh System Info</button>
+                        <div id="systemInfoSpinner" style="display:none;"><i class="fas fa-spinner fa-spin"></i> Loading...</div>
+                        <div id="systemInfoData" class="log-entry">Click "Refresh System Info" to load.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div id="logArea" class="card" style="display:none;"> <div class="card-header"><i class="fas fa-stream"></i> Event Log</div>
+            <div class="card-body" style="max-height: 300px; overflow-y: auto;">
+                <ul id="logList" class="list-unstyled"></ul>
+            </div>
+        </div>
+
+    </div>
+
+    <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.5.4/dist/umd/popper.min.js"></script>
+    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+
     <script>
-        // Function to load available Ollama models
-        function loadOllamaModels() {
-            fetch('/api/ollama-models')
-                .then(response => response.json())
-                .then(data => {
-                    const selector = document.getElementById('model-selector');
-                    const currentModelSpan = document.getElementById('current-model');
-                    const statusBadge = document.getElementById('model-status-badge');
-                    
-                    // Clear existing options
-                    selector.innerHTML = '';
-                    
-                    if (data.status === 'success') {
-                        // Update current model display
-                        currentModelSpan.textContent = data.current_model;
-                        statusBadge.textContent = 'Connected';
-                        statusBadge.className = 'badge bg-success';
-                        
-                        // Add options for each model
-                        if (data.models && data.models.length > 0) {
-                            data.models.forEach(model => {
-                                const option = document.createElement('option');
-                                option.value = model.name;
-                                option.textContent = model.name;
-                                
-                                // Format size in MB or GB
-                                let sizeText = '';
-                                if (model.size) {
-                                    const sizeInMB = model.size / (1024 * 1024);
-                                    if (sizeInMB > 1024) {
-                                        sizeText = ` (${(sizeInMB / 1024).toFixed(1)} GB)`;
-                                    } else {
-                                        sizeText = ` (${sizeInMB.toFixed(0)} MB)`;
-                                    }
-                                }
-                                
-                                option.textContent += sizeText;
-                                
-                                // Pre-select current model
-                                if (model.name === data.current_model) {
-                                    option.selected = true;
-                                }
-                                
-                                selector.appendChild(option);
-                            });
-                        } else {
-                            // No models found
-                            const option = document.createElement('option');
-                            option.value = '';
-                            option.textContent = 'No models available';
-                            selector.appendChild(option);
-                            
-                            statusBadge.textContent = 'No Models';
-                            statusBadge.className = 'badge bg-warning';
-                        }
+        $(document).ready(function() {
+            const MAX_LOG_ENTRIES = 100;
+            // currentAiProvider will be updated dynamically by API calls
+            // Initialize from the value passed by Flask (from app.config at startup)
+            let currentAiProvider = "{{ current_ai_provider_from_config | lower }}"; 
+            let jobStatusInterval; // Variable to hold the interval ID for auto-refresh
+
+            function showStatusMessage(message, type = 'info') {
+                const statusDiv = $('#statusMessage');
+                statusDiv.html(`<div class="alert alert-${type === 'error' ? 'danger' : type}" role="alert">${message}</div>`);
+                setTimeout(() => statusDiv.html(''), 5000);
+            }
+             function showUploadStatus(message, type = 'info') {
+                const uploadStatusDiv = $('#uploadStatus');
+                uploadStatusDiv.html(`<div class="alert alert-${type === 'error' ? 'danger' : type}" role="alert">${message}</div>`);
+                setTimeout(() => uploadStatusDiv.html(''), 5000);
+            }
+            function showAiModelStatus(message, type = 'info') {
+                const aiModelStatusDiv = $('#aiModelStatus');
+                aiModelStatusDiv.html(`<div class="alert alert-${type === 'error' ? 'danger' : type}" role="alert">${message}</div>`);
+            }
+            function showAiProviderStatus(message, type = 'info') {
+                const aiProviderStatusDiv = $('#aiProviderStatus');
+                aiProviderStatusDiv.html(`<div class="alert alert-${type === 'error' ? 'danger' : type}" role="alert">${message}</div>`);
+                 setTimeout(() => aiProviderStatusDiv.html(''), 7000);
+            }
+
+
+            function updateJobStatus(isManualRefresh = false) {
+                if (isManualRefresh) {
+                    $('#refreshStatusBtn').prop('disabled', true).html('<i class="fas fa-sync fa-spin"></i> Refreshing...');
+                }
+                $.getJSON('/api/status', function(data) {
+                    // Update Monitor Status
+                    const monitorStatusEl = $('#monitorStatus');
+                    if (data.monitor_active) {
+                        monitorStatusEl.text('ACTIVE').removeClass('badge-secondary badge-danger').addClass('badge-success');
+                        $('#startMonitoringBtn').prop('disabled', true);
+                        $('#stopMonitoringBtn').prop('disabled', false);
                     } else {
-                        // Error loading models
-                        const option = document.createElement('option');
-                        option.value = '';
-                        option.textContent = 'Error loading models';
-                        selector.appendChild(option);
-                        
-                        currentModelSpan.textContent = data.current_model || 'Unknown';
-                        statusBadge.textContent = 'Connection Error';
-                        statusBadge.className = 'badge bg-danger';
-                        
-                        showAlert('error', 'Failed to load models: ' + (data.message || 'Unknown error'));
+                        monitorStatusEl.text('INACTIVE').removeClass('badge-success').addClass('badge-danger');
+                         $('#startMonitoringBtn').prop('disabled', false);
+                        $('#stopMonitoringBtn').prop('disabled', true);
                     }
-                })
-                .catch(error => {
-                    console.error('Error fetching models:', error);
-                    
-                    const statusBadge = document.getElementById('model-status-badge');
-                    statusBadge.textContent = 'Connection Error';
-                    statusBadge.className = 'badge bg-danger';
-                    
-                    showAlert('error', 'Failed to connect to server: ' + error.message);
+
+                    // Update Active AI Provider display from status API
+                    if (data.current_ai_provider) {
+                        let newProvider = data.current_ai_provider.toLowerCase();
+                        if (currentAiProvider !== newProvider) { // If provider changed (e.g. by another session or backend)
+                            console.log(`AI Provider changed from ${currentAiProvider} to ${newProvider} via status update.`);
+                            currentAiProvider = newProvider;
+                            fetchAiModels(); // Refresh model list if provider changed
+                        }
+                        $('#activeAiProviderDisplay').text(data.current_ai_provider.toUpperCase()).removeClass('badge-secondary badge-info badge-success badge-danger').addClass('badge-info');
+                        $('#aiProviderSelect').val(currentAiProvider); 
+                        $('#selectedProviderForModelLabel').text(currentAiProvider.toUpperCase());
+                    }
+
+
+                    // Update Active Jobs
+                    const activeJobsList = $('#activeJobsList');
+                    activeJobsList.empty();
+                    $('#activeJobsCount').text(data.active_jobs_count || 0);
+                    if (data.active_jobs && data.active_jobs.length > 0) {
+                        data.active_jobs.forEach(job => {
+                            activeJobsList.append(`<tr><td>${job.id}</td><td>${job.machine}</td><td>${new Date(job.start_time).toLocaleString()}</td><td class="job-status-${job.status.toLowerCase()}">${job.status}</td></tr>`);
+                        });
+                    } else {
+                        activeJobsList.append('<tr><td colspan="4" class="text-center">No active jobs.</td></tr>');
+                    }
+
+                    // Update Completed Jobs
+                    const completedJobsList = $('#completedJobsList');
+                    completedJobsList.empty();
+                     $('#completedJobsCount').text(data.completed_jobs_count || 0);
+                    if (data.completed_jobs && data.completed_jobs.length > 0) {
+                        data.completed_jobs.forEach(job => {
+                            let statusClass = `job-status-${job.status.toLowerCase()}`;
+                            let updatesInfo = job.status === 'completed' ? `${job.total_updates_in_job || 0}` : 'N/A';
+                            let failedInfo = job.status === 'completed' ? `${job.failed_updates_in_job || 0}` : (job.status === 'failed' || job.status === 'error' ? 'N/A' : 'N/A');
+                            let rawOutputExcerpt = (job.results && typeof job.results.rawOutputExcerpt === 'string') ? job.results.rawOutputExcerpt : '';
+                            let details = job.error ? `<small class="text-muted">Error: ${escapeHtml(job.error)}</small>` : (rawOutputExcerpt ? `<button class="btn btn-xs btn-outline-secondary view-output-btn" data-output="${escapeHtml(rawOutputExcerpt)}">View Output</button>` : 'N/A');
+                            
+                            if (job.status === 'completed' && job.failed_updates_in_job > 0) {
+                                statusClass = 'job-status-failed'; 
+                            }
+
+                            completedJobsList.append(`
+                                <tr>
+                                    <td>${job.id.substring(0,12)}...</td>
+                                    <td>${job.machine}</td>
+                                    <td>${job.completion_time ? new Date(job.completion_time).toLocaleString() : 'N/A'}</td>
+                                    <td class="${statusClass}">${job.status}</td>
+                                    <td>${updatesInfo}</td>
+                                    <td>${failedInfo}</td>
+                                    <td>${details}</td>
+                                </tr>`);
+                        });
+                    } else {
+                        completedJobsList.append('<tr><td colspan="7" class="text-center">No completed jobs yet.</td></tr>');
+                    }
+                }).fail(function(jqXHR, textStatus, errorThrown) {
+                    showStatusMessage(`Error fetching status: ${textStatus} - ${errorThrown}`, 'error');
+                }).always(function() {
+                    if (isManualRefresh) {
+                        $('#refreshStatusBtn').prop('disabled', false).html('<i class="fas fa-sync-alt"></i> Refresh Status');
+                    }
                 });
-        }
-        
-        // Function to change the model
-        function changeModel() {
-            const selector = document.getElementById('model-selector');
-            const selectedModel = selector.value;
-            
-            if (!selectedModel) {
-                showAlert('warning', 'Please select a model');
-                return;
             }
             
-            fetch('/api/set-ollama-model', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ model: selectedModel })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.status === 'success') {
-                    const currentModelSpan = document.getElementById('current-model');
-                    currentModelSpan.textContent = data.current_model;
-                    
-                    showAlert('success', data.message);
-                } else {
-                    showAlert('error', 'Failed to change model: ' + (data.message || 'Unknown error'));
-                }
-            })
-            .catch(error => {
-                console.error('Error changing model:', error);
-                showAlert('error', 'Failed to connect to server: ' + error.message);
+            $('body').on('click', '.view-output-btn', function() {
+                const outputData = $(this).data('output');
+                alert("Raw Output Excerpt:\n\n" + outputData); 
             });
-        }
-        
-        // Helper function to show alerts
-        function showAlert(type, message) {
-            const alertDiv = document.getElementById('model-change-alert');
-            alertDiv.className = 'alert mt-3';
-            alertDiv.className += type === 'success' ? ' alert-success' : 
-                                 type === 'warning' ? ' alert-warning' : ' alert-danger';
-            alertDiv.textContent = message;
-            alertDiv.style.display = 'block';
             
-            // Auto-hide after 5 seconds
-            setTimeout(() => {
-                alertDiv.style.display = 'none';
-            }, 5000);
-        }
-        
-        // Event listeners
-        document.addEventListener('DOMContentLoaded', function() {
-            // Load models when page loads
-            loadOllamaModels();
+            function escapeHtml(unsafe) {
+                if (unsafe === null || unsafe === undefined) return '';
+                return String(unsafe) 
+                     .replace(/&/g, "&amp;")
+                     .replace(/</g, "&lt;")
+                     .replace(/>/g, "&gt;")
+                     .replace(/"/g, "&quot;")
+                     .replace(/'/g, "&#039;");
+            }
+
+            $('#startMonitoringBtn').click(function() {
+                $(this).prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Starting...');
+                $.post('/api/start-monitoring', function(data) {
+                    showStatusMessage(data.message || `Monitoring status: ${data.status}`, data.status === 'error' ? 'error' : 'success');
+                    updateJobStatus(); 
+                }).fail(function(jqXHR) {
+                    showStatusMessage(jqXHR.responseJSON ? jqXHR.responseJSON.message : 'Error starting monitoring.', 'error');
+                }).always(() => {
+                     $(this).prop('disabled', false).html('<i class="fas fa-play-circle"></i> Start File Monitoring');
+                     updateJobStatus(); 
+                });
+            });
+
+            $('#stopMonitoringBtn').click(function() {
+                $(this).prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Stopping...');
+                $.post('/api/stop-monitoring', function(data) {
+                    showStatusMessage(data.message || `Monitoring status: ${data.status}`, data.status === 'error' ? 'error' : 'success');
+                    updateJobStatus();
+                }).fail(function(jqXHR) {
+                     showStatusMessage(jqXHR.responseJSON ? jqXHR.responseJSON.message : 'Error stopping monitoring.', 'error');
+                }).always(() => {
+                    $(this).prop('disabled', false).html('<i class="fas fa-stop-circle"></i> Stop File Monitoring');
+                    updateJobStatus(); 
+                });
+            });
+
+            $('#uploadForm').submit(function(e) {
+                e.preventDefault();
+                const formData = new FormData(this);
+                const submitButton = $(this).find('button[type="submit"]');
+                submitButton.prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Processing...');
+
+                $.ajax({
+                    url: '/api/process-file', 
+                    type: 'POST',
+                    data: formData,
+                    processData: false,
+                    contentType: false,
+                    success: function(data) {
+                        showUploadStatus(data.message || 'File processing started.', 'success');
+                        $('#fileInput').val(''); 
+                        setTimeout(() => updateJobStatus(true), 2000); // Trigger a manual-like refresh
+                    },
+                    error: function(jqXHR) {
+                        showUploadStatus(jqXHR.responseJSON ? jqXHR.responseJSON.message : 'Error uploading file.', 'error');
+                    },
+                    complete: function() {
+                        submitButton.prop('disabled', false).html('<i class="fas fa-cogs"></i> Process File');
+                    }
+                });
+            });
+
+            $('#refreshStatusBtn').click(function() {
+                updateJobStatus(true); // Pass true for manual refresh
+            });
             
-            // Set up event handlers
-            document.getElementById('change-model-btn').addEventListener('click', changeModel);
-            document.getElementById('refresh-models-btn').addEventListener('click', loadOllamaModels);
+            $('#clearTransientDataBtn').click(function() {
+                if (!confirm("Are you sure you want to clear completed job data and the current session's processed file list? This action cannot be undone.")) return;
+                $(this).prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Clearing...');
+                $.post('/api/clear-transient-data', function(data) {
+                    showStatusMessage(data.message || 'Transient data cleared.', 'success');
+                    updateJobStatus(true); 
+                }).fail(function(jqXHR) {
+                    showStatusMessage(jqXHR.responseJSON ? jqXHR.responseJSON.message : 'Error clearing data.', 'error');
+                }).always(() => {
+                    $(this).prop('disabled', false).html('<i class="fas fa-eraser"></i> Clear Completed/Session Data');
+                });
+            });
+
+            $('#resetStateBtn').click(function() {
+                if (!confirm("WARNING: This will stop monitoring (if active) and reset ALL application state, including active and completed jobs. Are you absolutely sure?")) return;
+                $(this).prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Resetting...');
+                 $.post('/api/reset-state', function(data) {
+                    showStatusMessage(data.message || 'Application state reset.', 'success');
+                    updateJobStatus(true); 
+                    fetchAiModels(); 
+                }).fail(function(jqXHR) {
+                    showStatusMessage(jqXHR.responseJSON ? jqXHR.responseJSON.message : 'Error resetting state.', 'error');
+                }).always(() => {
+                    $(this).prop('disabled', false).html('<i class="fas fa-power-off"></i> Reset Full Application State');
+                });
+            });
+
+            // AI Provider Management
+            $('#setAiProviderBtn').click(function() {
+                const selectedProvider = $('#aiProviderSelect').val();
+                if (!selectedProvider) {
+                    showAiProviderStatus('Please select an AI provider.', 'warning');
+                    return;
+                }
+                $(this).prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Setting Provider...');
+                $.ajax({
+                    url: '/api/set-ai-provider',
+                    type: 'POST',
+                    contentType: 'application/json',
+                    data: JSON.stringify({ provider: selectedProvider }),
+                    success: function(data) {
+                        showAiProviderStatus(data.message || 'AI Provider set successfully.', 'success');
+                        currentAiProvider = data.current_ai_provider.toLowerCase(); 
+                        $('#activeAiProviderDisplay').text(currentAiProvider.toUpperCase());
+                        $('#selectedProviderForModelLabel').text(currentAiProvider.toUpperCase());
+                        fetchAiModels(); 
+                        updateJobStatus(); 
+                    },
+                    error: function(jqXHR) {
+                        showAiProviderStatus(jqXHR.responseJSON ? jqXHR.responseJSON.message : 'Error setting AI provider.', 'error');
+                    },
+                    complete: function() {
+                         $('#setAiProviderBtn').prop('disabled', false).html('<i class="fas fa-exchange-alt"></i> Set Provider for Session');
+                    }
+                });
+            });
+
+
+            // AI Model Management
+            function fetchAiModels() {
+                $('#aiModelControls').hide();
+                $('#aiModelNotSupported').hide();
+                $('#aiModelLoading').show();
+                $('#aiModelStatus').html(''); 
+
+                $('#selectedProviderForModelLabel').text(currentAiProvider.toUpperCase());
+
+                $.getJSON('/api/ai-provider-models', function(data) { 
+                    if (data.provider && data.provider.toLowerCase() !== currentAiProvider) {
+                        console.warn("Mismatch between JS currentAiProvider and API response provider during model fetch. Syncing from API response.");
+                        currentAiProvider = data.provider.toLowerCase();
+                        $('#activeAiProviderDisplay').text(currentAiProvider.toUpperCase());
+                        $('#selectedProviderForModelLabel').text(currentAiProvider.toUpperCase());
+                        $('#aiProviderSelect').val(currentAiProvider); 
+                    }
+
+                    if (data.status === 'success' && data.models && data.models.length > 0) {
+                        const modelSelect = $('#aiModelSelect');
+                        modelSelect.empty();
+                        $('#currentAiModel').text(data.current_model || 'Not Set').removeClass('badge-light badge-danger').addClass('badge-info');
+                        
+                        data.models.forEach(model => {
+                            let modelDisplayName = model.name;
+                            if (model.description) modelDisplayName += ` (${model.description})`;
+                            else if (model.size) modelDisplayName += ` (Size: ${(model.size / 1024 / 1024 / 1024).toFixed(2)} GB)`;
+                            
+                            modelSelect.append(`<option value="${model.name}" ${model.name === data.current_model ? 'selected' : ''}>${escapeHtml(modelDisplayName)}</option>`);
+                        });
+                        $('#aiModelControls').show();
+                    } else if (data.status === 'success' && (currentAiProvider === 'template' || (data.models && data.models.length === 0))) {
+                        $('#currentAiModel').text('N/A').removeClass('badge-info').addClass('badge-light');
+                        $('#unsupportedProviderName').text(currentAiProvider.toUpperCase());
+                        $('#aiModelNotSupported').show();
+                    } else {
+                         $('#currentAiModel').text('Error loading models').removeClass('badge-info badge-light').addClass('badge-danger');
+                        showAiModelStatus(data.message || 'Could not load AI models for ' + currentAiProvider.toUpperCase() + '.', 'error');
+                        $('#unsupportedProviderName').text(currentAiProvider.toUpperCase());
+                        $('#aiModelNotSupported').show(); 
+                    }
+                }).fail(function(jqXHR) {
+                    $('#currentAiModel').text('Error').addClass('badge-danger');
+                    showAiModelStatus(jqXHR.responseJSON ? jqXHR.responseJSON.message : 'Error fetching AI models.', 'error');
+                    $('#unsupportedProviderName').text(currentAiProvider.toUpperCase()); 
+                    $('#aiModelNotSupported').show(); 
+                }).always(function() {
+                     $('#aiModelLoading').hide();
+                });
+            }
+
+            $('#setAiModelBtn').click(function() {
+                const selectedModel = $('#aiModelSelect').val();
+                if (!selectedModel) {
+                    showAiModelStatus('Please select a model.', 'warning');
+                    return;
+                }
+                $(this).prop('disabled', true).html('<i class="fas fa-spinner fa-spin"></i> Setting...');
+                $.ajax({
+                    url: '/api/set-ai-model', 
+                    type: 'POST',
+                    contentType: 'application/json',
+                    data: JSON.stringify({ model: selectedModel }), 
+                    success: function(data) {
+                        showAiModelStatus(data.message || 'Model set successfully.', 'success');
+                        $('#currentAiModel').text(data.current_model);
+                    },
+                    error: function(jqXHR) {
+                        showAiModelStatus(jqXHR.responseJSON ? jqXHR.responseJSON.message : 'Error setting model.', 'error');
+                    },
+                    complete: function() {
+                        $('#setAiModelBtn').prop('disabled', false).html('<i class="fas fa-save"></i> Set Model for Session');
+                    }
+                });
+            });
+            
+            $('#refreshSystemInfoBtn').click(function() {
+                $('#systemInfoData').html('');
+                $('#systemInfoSpinner').show();
+                $(this).prop('disabled', true);
+
+                $.getJSON('/api/system-info', function(data) {
+                    let html = '<dl class="row">';
+                    for (const key in data) {
+                        html += `<dt class="col-sm-4 text-truncate">${formatKey(key)}</dt>`;
+                        if (typeof data[key] === 'object' && data[key] !== null) {
+                            html += '<dd class="col-sm-8"><ul class="list-unstyled mb-0">';
+                            for (const subKey in data[key]) {
+                                html += `<li><strong>${formatKey(subKey)}:</strong> ${escapeHtml(data[key][subKey])}</li>`;
+                            }
+                            html += '</ul></dd>';
+                        } else {
+                             html += `<dd class="col-sm-8">${escapeHtml(data[key])}</dd>`;
+                        }
+                    }
+                    html += '</dl>';
+                    $('#systemInfoData').html(html);
+                }).fail(function(jqXHR) {
+                     $('#systemInfoData').html(`<div class="alert alert-danger">Error loading system info: ${jqXHR.responseJSON ? escapeHtml(jqXHR.responseJSON.message) : 'Unknown error'}</div>`);
+                }).always(function() {
+                    $('#systemInfoSpinner').hide();
+                    $('#refreshSystemInfoBtn').prop('disabled', false);
+                });
+            });
+
+            function formatKey(key) {
+                return key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+            }
+
+            // Function to start auto-refresh
+            function startAutoRefresh() {
+                if (jobStatusInterval) {
+                    clearInterval(jobStatusInterval); // Clear existing interval if any
+                }
+                // Refresh job status every 10 seconds (adjust as needed)
+                jobStatusInterval = setInterval(function() {
+                    updateJobStatus(false); // Pass false, as this is not a manual click
+                }, 10000); 
+                console.log("Auto-refresh for job status started (10s interval).");
+            }
+
+            // Function to stop auto-refresh (optional, if you want to add a toggle later)
+            function stopAutoRefresh() {
+                if (jobStatusInterval) {
+                    clearInterval(jobStatusInterval);
+                    jobStatusInterval = null;
+                    console.log("Auto-refresh for job status stopped.");
+                }
+            }
+
+            // Initial Load
+            $('#aiProviderSelect').val(currentAiProvider); // Set dropdown from initial Flask var
+            updateJobStatus(true); // Initial manual-like refresh to load everything
+            fetchAiModels(); 
+            startAutoRefresh(); // Start auto-refreshing job statuses
+
         });
-        
-        // Refresh model list periodically (every 5 minutes)
-        setInterval(loadOllamaModels, 5 * 60 * 1000);
     </script>
 </body>
 </html>

@@ -15,8 +15,13 @@ services:
       - DEBUG=True
       - AUTO_START_MONITORING=False
       - OLLAMA_URL=http://host.docker.internal:11434/api/generate
-      - AI_PROVIDER=ollama
+      - AI_PROVIDER=vllm
       - OLLAMA_MODEL=mistral
+      - VLLM_CHAT_COMPLETIONS_URL=https://vllm.rangeresources.com/v1/chat/completions 
+      - VLLM_MODELS_URL=https://vllm.rangeresources.com/v1/models 
+      - VLLM_MODEL=Qwen/Qwen3-30B-A3B-FP8
+      - VLLM_VERIFY_SSL=False 
+      - VLLM_API_KEY=123456789
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

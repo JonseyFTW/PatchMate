@@ -14,13 +14,14 @@ import traceback
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, render_template, jsonify, request, redirect, url_for
+from werkzeug.utils import secure_filename # For secure file uploads
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver
 from datetime import datetime
 import pandas as pd
 import openai
-import openpyxl
+# import openpyxl # Imported dynamically in update_requirements
 
 # Configure logging
 logging.basicConfig(
@@ -39,24 +40,32 @@ app.config.from_pyfile('config.py')
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 # Global variables
-ACTIVE_JOBS = {}
-COMPLETED_JOBS = {}
-SERVER_RESULTS = []
-MONITOR_ACTIVE = False
-observer = None
+# Using a simple dictionary to hold app state to allow for easier reset and management
+APP_STATE = {
+    "active_jobs": {},
+    "completed_jobs": {},
+    "server_results": [],
+    "monitor_active": False,
+    "observer": None,
+    "processed_files_on_startup": set() # For FileSystemEventHandler
+}
 
 def initialize_app_state():
     """Initialize or reset application state variables"""
-    global ACTIVE_JOBS, COMPLETED_JOBS, SERVER_RESULTS, MONITOR_ACTIVE, observer
-    
-    # Clear all dictionaries and lists
-    ACTIVE_JOBS = {}
-    COMPLETED_JOBS = {}
-    SERVER_RESULTS = []
-    MONITOR_ACTIVE = False
-    observer = None
-    
-    logger.info("Application state initialized")
+    global APP_STATE
+    APP_STATE["active_jobs"] = {}
+    APP_STATE["completed_jobs"] = {}
+    APP_STATE["server_results"] = []
+    APP_STATE["monitor_active"] = False
+    if APP_STATE["observer"]:
+        try:
+            APP_STATE["observer"].stop()
+            APP_STATE["observer"].join()
+        except Exception as e:
+            logger.warning(f"Could not stop existing observer during reset: {e}")
+        APP_STATE["observer"] = None
+    APP_STATE["processed_files_on_startup"] = set() # Reset this as well
+    logger.info("Application state initialized/reset")
 
 # Initialize app state when module is loaded
 initialize_app_state()
@@ -67,134 +76,130 @@ initialize_app_state()
 class EnhancedFileHandler(FileSystemEventHandler):
     """Enhanced file handler that supports both CSV and Excel files and multiple event types"""
     
+    def __init__(self):
+        super().__init__()
+        # Initialize _processed_files here if you want it per instance,
+        # or use a global/persistent store for tracking across restarts/instances.
+        # For this context, using a set tracked within APP_STATE for the current run.
+        self._processed_this_session = APP_STATE["processed_files_on_startup"]
+
     def process_file(self, file_path):
         """Common logic to process detected files"""
         if not os.path.isdir(file_path):
             file_ext = os.path.splitext(file_path)[1].lower()
             
-            # Log verbose information about detected file
             logger.info(f"File detected: {file_path}")
             logger.info(f"File extension: {file_ext}")
             
-            # Process CSV and Excel files
             if file_ext in ['.csv', '.xlsx', '.xls']:
+                if file_path in self._processed_this_session:
+                    logger.info(f"File {file_path} already processed in this session. Skipping.")
+                    return
+
                 logger.info(f"Processing supported file: {file_path}")
                 try:
                     process_machine_file(file_path)
+                    self._processed_this_session.add(file_path) # Add after successful attempt to process
                 except Exception as e:
                     logger.error(f"Error processing file {file_path}: {str(e)}")
             else:
                 logger.info(f"Ignoring unsupported file type: {file_ext}")
     
     def on_created(self, event):
-        """Handle file creation events"""
         logger.debug(f"Creation event detected: {event.src_path}")
         self.process_file(event.src_path)
     
     def on_modified(self, event):
-        """Handle file modification events"""
         logger.debug(f"Modification event detected: {event.src_path}")
-        # Only process if it's a file (not a directory) and exists
         if not event.is_directory and os.path.exists(event.src_path):
-            # Check if this file has been processed before
-            # This helps prevent duplicate processing of the same file
-            file_path = event.src_path
-            if not hasattr(self, '_processed_files'):
-                self._processed_files = set()
-            
-            if file_path not in self._processed_files:
-                self._processed_files.add(file_path)
-                self.process_file(file_path)
+            self.process_file(event.src_path) # process_file now handles the check for already processed
     
     def on_moved(self, event):
-        """Handle file moved events (often triggered when files are saved by external programs)"""
         logger.debug(f"Move event detected: {event.dest_path}")
         self.process_file(event.dest_path)
 
-def normalize_path(path):
-    """Normalize a file path to prevent issues with semicolons and other special characters"""
-    # Remove problematic characters that might create multiple directories
-    clean_path = path.replace(';', '').replace('\\', '/').strip()
-    
-    # Convert Windows paths to Unix format
-    if ':' in clean_path:
-        # Handle Windows paths like C:\path\to\dir
-        parts = clean_path.split(':')
-        if len(parts) > 1:
-            clean_path = parts[1]  # Take the part after the drive letter
-    
-    # Ensure no trailing slash
-    clean_path = clean_path.rstrip('/')
-    
-    logger.info(f"Normalized path from '{path}' to '{clean_path}'")
-    return clean_path
+def normalize_path_conservative(path_str):
+    """Normalizes a path by replacing backslashes and stripping whitespace.
+    Does NOT attempt to remove drive letters or other complex transformations
+    that might break valid absolute paths.
+    """
+    if not isinstance(path_str, str):
+        logger.warning(f"normalize_path_conservative received non-string input: {type(path_str)}. Returning as is.")
+        return path_str
+    # Replace backslashes with forward slashes for consistency
+    normalized = path_str.replace('\\', '/')
+    # Strip leading/trailing whitespace
+    normalized = normalized.strip()
+    # Remove trailing slash if it's not the root directory
+    if len(normalized) > 1 and normalized.endswith('/'):
+        normalized = normalized[:-1]
+    logger.debug(f"Normalized path from '{path_str}' to '{normalized}' (conservative)")
+    return normalized
 
-# Update the ensure_directory_exists function
+
 def ensure_directory_exists(path):
-    """Safely create a directory if it doesn't exist"""
-    # Normalize the path first
-    path = normalize_path(path)
-    
-    if not os.path.exists(path):
-        logger.info(f"Creating directory: {path}")
+    """Safely create a directory if it doesn't exist. Uses conservative normalization."""
+    # Use the original path for os.path.exists and os.makedirs
+    # Normalization here should be minimal and safe.
+    # path_to_check = normalize_path_conservative(path) # Conservative normalization
+    path_to_check = path # Using original path directly for os functions
+
+    if not os.path.exists(path_to_check):
+        logger.info(f"Creating directory: {path_to_check}")
         try:
-            os.makedirs(path, exist_ok=True)
+            os.makedirs(path_to_check, exist_ok=True)
             return True
         except Exception as e:
-            logger.error(f"Failed to create directory {path}: {str(e)}")
+            logger.error(f"Failed to create directory {path_to_check}: {str(e)}")
             return False
     else:
-        logger.info(f"Directory already exists: {path}")
+        logger.info(f"Directory already exists: {path_to_check}")
         return True
     
 def process_machine_file(file_path):
-    """Process a file containing machine names (supports CSV and Excel)"""
     logger.info(f"Processing machine file: {file_path}")
     
     try:
-        # Determine file type
         file_ext = os.path.splitext(file_path)[1].lower()
         
-        # Read the file into a pandas DataFrame based on file type
         if file_ext == '.csv':
             logger.info(f"Reading CSV file: {file_path}")
             try:
-                df = pd.read_csv(file_path, encoding='utf-8-sig')  # Handle BOM if present
+                df = pd.read_csv(file_path, encoding='utf-8-sig')
+            except UnicodeDecodeError:
+                logger.warning(f"UTF-8-SIG decoding failed for {file_path}, trying latin1.")
+                df = pd.read_csv(file_path, encoding='latin1')
             except Exception as e:
-                logger.warning(f"Error reading with utf-8-sig: {str(e)}, trying other encodings")
-                df = pd.read_csv(file_path, encoding='latin1')  # Try another encoding
+                logger.error(f"Error reading CSV {file_path}: {str(e)}")
+                raise # Re-raise after logging
         elif file_ext in ['.xlsx', '.xls']:
             logger.info(f"Reading Excel file: {file_path}")
-            df = pd.read_excel(file_path)
+            try:
+                df = pd.read_excel(file_path)
+            except Exception as e:
+                logger.error(f"Error reading Excel file {file_path}: {str(e)}")
+                raise # Re-raise
         else:
             logger.error(f"Unsupported file extension: {file_ext}")
             return
         
-        # Log column names for debugging
         logger.info(f"Columns found in file: {df.columns.tolist()}")
-        
-        # Find machine name column using flexible pattern matching
         machine_col = find_machine_name_column(df)
         
         if not machine_col:
-            logger.error("Could not find a column containing machine names")
+            logger.error("Could not find a column containing machine names in the file.")
             return
         
         logger.info(f"Using column '{machine_col}' for machine names")
-        
-        # Extract machine names
-        machines = df[machine_col].dropna().tolist()
+        machines = df[machine_col].dropna().astype(str).tolist() # Ensure strings
         logger.info(f"Found {len(machines)} machines in file")
         
-        # Log the first few machine names for verification
         if machines:
             logger.info(f"Sample machine names: {machines[:min(5, len(machines))]}")
         
-        # Process each machine
-        for machine in machines:
-            machine = str(machine).strip()  # Convert to string and strip whitespace
-            if machine:
-                # Start a thread for each machine to process in parallel
+        for machine_raw in machines:
+            machine = str(machine_raw).strip() # Ensure machine name is a string and stripped
+            if machine: # Check if machine name is not empty after stripping
                 threading.Thread(
                     target=process_machine,
                     args=(machine,),
@@ -202,107 +207,114 @@ def process_machine_file(file_path):
                 ).start()
                 logger.info(f"Started processing thread for machine: {machine}")
             else:
-                logger.warning("Skipping empty machine name")
+                logger.warning("Skipping empty machine name found in file.")
     
     except Exception as e:
-        logger.error(f"Error processing file {file_path}: {str(e)}")
-        logger.exception("Detailed traceback:")
-        raise
+        logger.error(f"Critical error in process_machine_file for {file_path}: {str(e)}")
+        logger.exception("Detailed traceback for process_machine_file:")
+        # Don't re-raise here as this function is often called from a thread or event handler
 
 def start_file_monitoring():
-    global MONITOR_ACTIVE, observer
-    
-    if MONITOR_ACTIVE:
+    if APP_STATE["monitor_active"]:
         return {"status": "already_running"}
     
-    path = normalize_path(app.config['WATCH_DIRECTORY'])
-    logger.info(f"Starting file monitoring on {path}")
+    watch_dir = app.config['WATCH_DIRECTORY']
+    logger.info(f"Attempting to start file monitoring on: {watch_dir}")
     
     try:
-        # Verify the directory exists
-        if not os.path.exists(path):
-            logger.info(f"Creating directory: {path}")
-            os.makedirs(path, exist_ok=True)
-        
-        # List contents of the directory for debugging
+        # Use the original path from config for os.path.exists
+        if not os.path.exists(watch_dir):
+            logger.info(f"Watch directory {watch_dir} does not exist. Attempting to create.")
+            if not ensure_directory_exists(watch_dir): # ensure_directory_exists handles its own logging
+                 logger.error(f"Failed to create watch directory {watch_dir}. Monitoring cannot start.")
+                 return {"status": "error", "message": f"Failed to create watch directory: {watch_dir}"}
+
         try:
-            contents = os.listdir(path)
-            logger.info(f"Contents of {path}: {contents}")
+            contents = os.listdir(watch_dir)
+            logger.info(f"Contents of {watch_dir}: {contents}")
         except Exception as e:
-            logger.warning(f"Could not list directory contents: {str(e)}")
+            logger.warning(f"Could not list directory contents for {watch_dir}: {str(e)}")
         
-        # Use the enhanced file handler with additional logging
         event_handler = EnhancedFileHandler()
+        # Using PollingObserver as a fallback for network drives or systems where InotifyObserver might fail
+        APP_STATE["observer"] = PollingObserver(timeout=5) # Increased timeout slightly
+        APP_STATE["observer"].schedule(event_handler, watch_dir, recursive=False)
+        APP_STATE["observer"].start()
+        APP_STATE["monitor_active"] = True
         
-        # Use PollingObserver for more reliable monitoring with Docker volumes
-        from watchdog.observers.polling import PollingObserver
-        observer = PollingObserver(timeout=1)  # Poll every 1 second
-        
-        observer.schedule(event_handler, path, recursive=False)
-        observer.start()
-        MONITOR_ACTIVE = True
-        
-        logger.info(f"File monitoring started on {path} (using polling observer)")
-        
-        # Start a periodic directory check thread for additional reliability
-        threading.Thread(
-            target=periodic_directory_check,
-            args=(path,),
-            daemon=True
-        ).start()
-        
+        logger.info(f"File monitoring started on {watch_dir} (using polling observer)")
+        # The periodic_directory_check might be redundant with PollingObserver,
+        # but can act as a safety net or be removed if PollingObserver is reliable.
+        # For now, keeping it as it was part of the original logic.
+        threading.Thread(target=periodic_directory_check, args=(watch_dir,), daemon=True).start()
         return {"status": "started"}
     except Exception as e:
-        logger.error(f"Failed to start monitoring: {str(e)}")
-        logger.exception("Detailed traceback:")
+        logger.error(f"Failed to start monitoring on {watch_dir}: {str(e)}")
+        logger.exception("Detailed traceback for start_file_monitoring:")
         return {"status": "error", "message": str(e)}
 
 def periodic_directory_check(directory_path):
-    """Periodically check the directory for new files as a backup mechanism"""
+    """Periodically checks for new files, complementing Watchdog."""
     last_check_files = set()
-    
-    while MONITOR_ACTIVE:
+    # Populate initial set of files to avoid processing existing files on first run
+    # if the monitor starts after files are already there.
+    # Note: EnhancedFileHandler also has its own `_processed_this_session` logic.
+    # This initial population helps avoid redundant processing if files were added
+    # *just* before the check loop started but *after* monitor initialization.
+    try:
+        if os.path.exists(directory_path):
+            for filename in os.listdir(directory_path):
+                full_path = os.path.join(directory_path, filename)
+                if os.path.isfile(full_path):
+                    last_check_files.add(full_path)
+            logger.info(f"Periodic check initialized with {len(last_check_files)} files in {directory_path}")
+    except Exception as e:
+        logger.error(f"Error during initial population in periodic_directory_check for {directory_path}: {str(e)}")
+
+
+    while APP_STATE["monitor_active"]:
         try:
-            # Get current files in directory
             current_files = set()
+            if not os.path.exists(directory_path):
+                logger.warning(f"Periodic check: Directory {directory_path} not found. Skipping check.")
+                time.sleep(30) # Wait before next check
+                continue
+
             for filename in os.listdir(directory_path):
                 full_path = os.path.join(directory_path, filename)
                 if os.path.isfile(full_path):
                     current_files.add(full_path)
             
-            # Find new files since last check
             new_files = current_files - last_check_files
             if new_files:
                 logger.info(f"Periodic check found {len(new_files)} new files: {new_files}")
                 for file_path in new_files:
-                    # Process each new file
+                    # Check against EnhancedFileHandler's processed set as well to be sure
+                    if file_path in APP_STATE["processed_files_on_startup"]:
+                        logger.info(f"Periodic check: File {file_path} already handled by Watchdog. Skipping.")
+                        continue
                     try:
                         file_ext = os.path.splitext(file_path)[1].lower()
                         if file_ext in ['.csv', '.xlsx', '.xls']:
-                            logger.info(f"Processing found file: {file_path}")
+                            logger.info(f"Periodic check processing found file: {file_path}")
                             process_machine_file(file_path)
+                            APP_STATE["processed_files_on_startup"].add(file_path) # Mark as processed
                     except Exception as e:
-                        logger.error(f"Error processing found file {file_path}: {str(e)}")
-            
-            # Update last check files
+                        logger.error(f"Error processing found file {file_path} in periodic check: {str(e)}")
             last_check_files = current_files
-            
         except Exception as e:
-            logger.error(f"Error in periodic directory check: {str(e)}")
-        
-        # Sleep for 30 seconds before next check
-        time.sleep(30)
+            logger.error(f"Error in periodic directory check loop: {str(e)}")
+        time.sleep(30) # Check interval
+    logger.info("Periodic directory check thread stopped.")
     
 def stop_file_monitoring():
-    global MONITOR_ACTIVE, observer
-    
-    if not MONITOR_ACTIVE:
+    if not APP_STATE["monitor_active"] or not APP_STATE["observer"]:
         return {"status": "not_running"}
-    
     try:
-        observer.stop()
-        observer.join()
-        MONITOR_ACTIVE = False
+        APP_STATE["observer"].stop()
+        APP_STATE["observer"].join() # Wait for the observer thread to finish
+        APP_STATE["monitor_active"] = False
+        APP_STATE["observer"] = None # Clear the observer object
         logger.info("File monitoring stopped")
         return {"status": "stopped"}
     except Exception as e:
@@ -312,1193 +324,1393 @@ def stop_file_monitoring():
 # --- File Processing ---
 
 def find_machine_name_column(df):
-    """Find the column that most likely contains machine names using flexible pattern matching"""
-    # Common patterns for machine name columns
-    patterns = [
-        r'machine.*name',
-        r'computer.*name',
-        r'host.*name',
-        r'server.*name',
-        r'machine',
-        r'computer',
-        r'host',
-        r'server',
-        r'name'
+    """Improved logic to find the machine name column."""
+    # Prefer columns explicitly named "Machine Name", "Computer Name", etc.
+    preferred_patterns = [
+        r'^machine\s*name$', r'^computer\s*name$', r'^host\s*name$', r'^server\s*name$'
     ]
-    
-    # Check for exact matches first (with case insensitivity)
     for col in df.columns:
-        col_lower = col.lower()
-        if 'machine' in col_lower and 'name' in col_lower:
+        col_str = str(col) # Ensure column name is a string
+        for pattern in preferred_patterns:
+            if re.search(pattern, col_str.lower().strip()):
+                return col
+
+    # Broader patterns
+    patterns = [
+        r'machine', r'computer', r'host', r'server', r'name'
+    ]
+    for col in df.columns:
+        col_str = str(col)
+        if 'machine' in col_str.lower() and 'name' in col_str.lower(): # Common combination
             return col
-    
-    # Try regex patterns
     for pattern in patterns:
         for col in df.columns:
-            if re.search(pattern, col.lower()):
+            col_str = str(col)
+            if re.search(pattern, col_str.lower().strip()):
                 return col
     
-    # If no matches found and we have a small number of columns, use the first text column
+    # If few columns, check for typical machine name format (alphanumeric, dots, hyphens)
     if len(df.columns) <= 3:
         for col in df.columns:
-            # Check if column contains text data that could be server names
             if df[col].dtype == 'object' and not df[col].empty:
-                # Check if values look like machine names (alphanumeric with possible dots or hyphens)
-                sample = df[col].dropna().iloc[0] if not df[col].dropna().empty else ''
-                if isinstance(sample, str) and re.match(r'^[a-zA-Z0-9\.\-]+$', sample):
-                    return col
-    
-    # Fallback: If we have only one column, use it regardless of name
+                # Get a sample of non-null values to check format
+                samples = df[col].dropna()
+                if not samples.empty:
+                    # Check if a good portion of samples match machine name regex
+                    match_count = 0
+                    for sample_val in samples.head(5): # Check first 5 non-null samples
+                        if isinstance(sample_val, str) and re.match(r'^[a-zA-Z0-9.\-]+$', sample_val.strip()):
+                            match_count += 1
+                    if match_count > 0 : # If at least one matches, consider it a candidate
+                        logger.info(f"Column '{col}' selected by content format heuristic.")
+                        return col
+                        
+    # Fallback: if only one column, use it
     if len(df.columns) == 1:
         return df.columns[0]
-    
-    # No suitable column found
+        
+    logger.warning("Could not definitively identify machine name column.")
     return None
 
+
 def process_machine(machine_name):
-    """Process updates for a specific machine"""
     logger.info(f"Processing machine: {machine_name}")
-    job_id = None
+    job_id = None # Initialize job_id
     
     try:
-        # Run the Azure Automation runbook
         job_id = run_azure_runbook(machine_name)
         
         if not job_id:
-            logger.error(f"Failed to start runbook for {machine_name}")
-            # Add to completed jobs with error status
-            error_id = f"error-{machine_name}-{int(time.time())}"
-            COMPLETED_JOBS[error_id] = {
-                "machine": machine_name,
-                "status": "error",
-                "error": "Failed to start runbook",
+            logger.error(f"Failed to start runbook for {machine_name}. No Job ID received.")
+            # Create a unique ID for this error entry
+            error_id = f"error_{machine_name.replace('.', '_')}_{int(time.time())}"
+            APP_STATE["completed_jobs"][error_id] = {
+                "machine": machine_name, "status": "error",
+                "error": "Failed to start runbook (no Job ID)",
                 "completion_time": datetime.now().isoformat()
             }
+            check_all_complete() # Check if this was the last one
             return
         
-        # Add job to active jobs
-        ACTIVE_JOBS[job_id] = {
-            "machine": machine_name,
-            "start_time": datetime.now().isoformat(),
+        APP_STATE["active_jobs"][job_id] = {
+            "machine": machine_name, "start_time": datetime.now().isoformat(),
             "status": "running"
         }
         
-        # Poll job status until complete
-        job_output = poll_job_status(job_id)
+        # This function now handles its own error states and returns None or output
+        job_output_text = poll_job_status(job_id) # This can take time
         
-        # Process the results
-        if job_output:
-            # Parse the job output
-            results = parse_job_output(job_output, machine_name)
-            
-            # Store the results
-            COMPLETED_JOBS[job_id] = {
-                "machine": machine_name,
-                "status": "completed",
+        # Ensure job is removed from active_jobs once polling is done, regardless of outcome
+        if job_id in APP_STATE["active_jobs"]:
+            del APP_STATE["active_jobs"][job_id]
+
+        if job_output_text is not None: # job_output can be empty string if successful but no output
+            # Parse the new structured output
+            results = parse_job_output(job_output_text, machine_name) 
+            APP_STATE["completed_jobs"][job_id] = {
+                "machine": results.get("serverName", machine_name), # Use server name from results if available
+                "status": results.get("executionStatus", "completed").lower(), # Use executionStatus
+                "completion_time": datetime.now().isoformat(), 
+                "results": results # Store the full structured results
+            }
+            # Add to server_results for reporting (this list is cleared after each report)
+            APP_STATE["server_results"].append(results) 
+            logger.info(f"Completed processing for {results.get('serverName', machine_name)}: {results.get('totalUpdates', 0)} updates, {len(results.get('failedUpdates', []))} failed. Execution Status: {results.get('executionStatus')}")
+        else: # poll_job_status returned None, indicating failure or timeout
+            logger.error(f"Failed to get output or job failed for job {job_id} (machine: {machine_name}).")
+            APP_STATE["completed_jobs"][job_id] = {
+                "machine": machine_name, "status": "failed",
+                "error": "Job failed, timed out, or no output received from Azure.",
                 "completion_time": datetime.now().isoformat(),
-                "results": results
-            }
-            
-            # Add to server results
-            SERVER_RESULTS.append(results)
-            
-            logger.info(f"Completed processing for {machine_name}: {results['totalUpdates']} updates, {len(results['failedUpdates'])} failed")
-        else:
-            logger.error(f"Failed to get output for job {job_id} (machine: {machine_name})")
-            COMPLETED_JOBS[job_id] = {
-                "machine": machine_name,
-                "status": "failed",
-                "error": "Failed to get job output",
-                "completion_time": datetime.now().isoformat()
+                "results": {"serverName": machine_name, "executionStatus": "Failed", "errorMessage": "Job polling failed or timed out."} # Add minimal results
             }
         
-        # Remove from active jobs
-        if job_id in ACTIVE_JOBS:
-            del ACTIVE_JOBS[job_id]
-            
-        # Check if all machines are processed
-        check_all_complete()
+        check_all_complete() # Check if all jobs are done after this one
     
     except Exception as e:
-        logger.error(f"Error processing machine {machine_name}: {str(e)}")
-        logger.exception("Traceback:")
+        logger.error(f"Unhandled error in process_machine for {machine_name}: {str(e)}")
+        logger.exception(f"Traceback for process_machine {machine_name}:")
         
-        # Ensure we track the failure in completed jobs
-        job_key = job_id if job_id else f"error-{machine_name}-{int(time.time())}"
-        COMPLETED_JOBS[job_key] = {
-            "machine": machine_name,
-            "status": "error",
-            "error": str(e),
-            "completion_time": datetime.now().isoformat()
+        # Ensure job is removed from active_jobs if an exception occurred before it was normally removed
+        if job_id and job_id in APP_STATE["active_jobs"]:
+            del APP_STATE["active_jobs"][job_id]
+
+        job_key_for_error = job_id if job_id else f"error_{machine_name.replace('.', '_')}_{int(time.time())}"
+        APP_STATE["completed_jobs"][job_key_for_error] = {
+            "machine": machine_name, "status": "error",
+            "error": f"Unhandled exception: {str(e)}",
+            "completion_time": datetime.now().isoformat(),
+            "results": {"serverName": machine_name, "executionStatus": "Error", "errorMessage": str(e)} # Add minimal results
         }
-        
-        # Remove from active jobs if it was there
-        if job_id and job_id in ACTIVE_JOBS:
-            del ACTIVE_JOBS[job_id]
-            
-        # Still check if all machines are processed
         check_all_complete()
 
+
 def update_requirements():
-    """Install required packages for Excel support if they're not already installed"""
+    """Install required packages for Excel support if they're not already installed.
+       This should ideally be handled by requirements.txt and deployment process."""
+    missing_packages = []
     try:
         import openpyxl
-        import xlrd
-        logger.info("Excel support libraries already installed")
+        logger.debug("openpyxl found.")
     except ImportError:
-        logger.info("Installing Excel support libraries")
+        missing_packages.append("openpyxl")
+    try:
+        import xlrd
+        logger.debug("xlrd found.")
+    except ImportError:
+        missing_packages.append("xlrd")
+
+    if missing_packages:
+        logger.info(f"Attempting to install missing Excel support libraries: {', '.join(missing_packages)}")
         import subprocess
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl", "xlrd"])
-            logger.info("Successfully installed Excel support libraries")
+            args = [sys.executable, "-m", "pip", "install"] + missing_packages
+            subprocess.check_call(args)
+            logger.info(f"Successfully installed {', '.join(missing_packages)}")
+            # Attempt to re-import after installing
+            if "openpyxl" in missing_packages:
+                global openpyxl # Make it available globally if installed this session
+                import openpyxl
+            if "xlrd" in missing_packages:
+                global xlrd
+                import xlrd
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to install Excel support libraries using pip: {str(e)}")
+            logger.error("Please install them manually: pip install openpyxl xlrd")
         except Exception as e:
-            logger.error(f"Failed to install Excel support libraries: {str(e)}")
-            logger.error("You may need to manually install them: pip install openpyxl xlrd")
+            logger.error(f"An unexpected error occurred during pip install: {str(e)}")
+    else:
+        logger.info("Excel support libraries (openpyxl, xlrd) are already installed.")
+
 
 # --- Azure Integration ---
 
-def process_machine(machine_name):
-    """Process updates for a specific machine"""
-    logger.info(f"Processing machine: {machine_name}")
-    
-    try:
-        # Run the Azure Automation runbook
-        job_id = run_azure_runbook(machine_name)
-        
-        if not job_id:
-            logger.error(f"Failed to start runbook for {machine_name}")
-            return
-        
-        # Add job to active jobs
-        ACTIVE_JOBS[job_id] = {
-            "machine": machine_name,
-            "start_time": datetime.now().isoformat(),
-            "status": "running"
-        }
-        
-        # Poll job status until complete
-        job_output = poll_job_status(job_id)
-        
-        if not job_output:
-            logger.error(f"Failed to get output for job {job_id} (machine: {machine_name})")
-            COMPLETED_JOBS[job_id] = {
-                "machine": machine_name,
-                "status": "failed",
-                "error": "Failed to get job output"
-            }
-            return
-        
-        # Parse the job output
-        results = parse_job_output(job_output, machine_name)
-        
-        # Store the results
-        COMPLETED_JOBS[job_id] = {
-            "machine": machine_name,
-            "status": "completed",
-            "completion_time": datetime.now().isoformat(),
-            "results": results
-        }
-        
-        # Add to server results
-        SERVER_RESULTS.append(results)
-        
-        # Remove from active jobs
-        if job_id in ACTIVE_JOBS:
-            del ACTIVE_JOBS[job_id]
-        
-        # Check if all machines are processed
-        check_all_complete()
-    
-    except Exception as e:
-        logger.error(f"Error processing machine {machine_name}: {str(e)}")
-        if job_id:
-            COMPLETED_JOBS[job_id] = {
-                "machine": machine_name,
-                "status": "error",
-                "error": str(e)
-            }
-
 def run_azure_runbook(machine_name):
-    """Run the Azure Automation runbook and return the job ID"""
     logger.info(f"Running Azure runbook for {machine_name}")
-    
     try:
         webhook_url = app.config['AZURE_WEBHOOK_URL']
+        payload = {"ComputerName": machine_name}
+        # Increased timeout for webhook trigger
+        response = requests.post(webhook_url, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
         
-        payload = {
-            "ComputerName": machine_name
-        }
-        
-        response = requests.post(
-            webhook_url,
-            json=payload,
-            headers={"Content-Type": "application/json"}
-        )
-        
-        if response.status_code == 202:
-            # Extract the job ID from the response
-            result = response.json()
-            job_id = result.get('JobIds', [None])[0]
-            logger.info(f"Runbook started for {machine_name}, Job ID: {job_id}")
-            return job_id
+        # Check for successful acceptance (202), but also other 2xx codes that might indicate success.
+        if 200 <= response.status_code < 300:
+            try:
+                result = response.json()
+                job_ids = result.get('JobIds') # Webhook response format
+                if job_ids and isinstance(job_ids, list) and len(job_ids) > 0:
+                    job_id = job_ids[0]
+                    logger.info(f"Runbook started for {machine_name}, Job ID: {job_id}")
+                    return job_id
+                else:
+                    logger.error(f"Runbook triggered for {machine_name}, but no JobIds returned in response. Response: {response.text}")
+                    return None
+            except json.JSONDecodeError:
+                logger.error(f"Failed to decode JSON response from webhook for {machine_name}. Status: {response.status_code}, Response: {response.text}")
+                return None
         else:
-            logger.error(f"Failed to start runbook: {response.status_code} - {response.text}")
+            logger.error(f"Failed to start runbook for {machine_name}: {response.status_code} - {response.text}")
             return None
-    
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout triggering Azure runbook for {machine_name}.")
+        return None
+    except requests.exceptions.RequestException as e: # Catch other request errors
+        logger.error(f"Error running Azure runbook for {machine_name}: {str(e)}")
+        return None
     except Exception as e:
-        logger.error(f"Error running Azure runbook: {str(e)}")
+        logger.error(f"Unexpected error in run_azure_runbook for {machine_name}: {str(e)}")
         return None
 
-# --- Update these two functions in app.py ---
 
 def poll_job_status(job_id):
-    """Poll the job status until complete and return the job output"""
     logger.info(f"Polling job status for job ID: {job_id}")
+    
+    access_token = get_azure_token()
+    if not access_token:
+        logger.error(f"Failed to get Azure access token for polling job {job_id}. Cannot proceed.")
+        return None # Critical: cannot proceed without token
+        
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
     
     subscription_id = app.config['AZURE_SUBSCRIPTION_ID']
     resource_group = app.config['AZURE_RESOURCE_GROUP']
     automation_account = app.config['AZURE_AUTOMATION_ACCOUNT']
     
-    status_url = f"https://management.azure.com/subscriptions/{subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.Automation/automationAccounts/{automation_account}/jobs/{job_id}?api-version=2019-06-01"
-    output_url = f"https://management.azure.com/subscriptions/{subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.Automation/automationAccounts/{automation_account}/jobs/{job_id}/output?api-version=2019-06-01"
+    status_url = (f"https://management.azure.com/subscriptions/{subscription_id}"
+                  f"/resourceGroups/{resource_group}/providers/Microsoft.Automation"
+                  f"/automationAccounts/{automation_account}/jobs/{job_id}?api-version=2019-06-01")
+    output_url = (f"https://management.azure.com/subscriptions/{subscription_id}"
+                  f"/resourceGroups/{resource_group}/providers/Microsoft.Automation"
+                  f"/automationAccounts/{automation_account}/jobs/{job_id}/output?api-version=2019-06-01")
     
-    # Get the access token
-    access_token = get_azure_token()
-    
-    if not access_token:
-        logger.error("Failed to get Azure access token")
-        return None
-    
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-    
-    # Poll status until job is complete
-    max_attempts = 30
+    max_attempts = 30  # e.g., 30 attempts * 20 seconds = 10 minutes
+    poll_interval = 20 # seconds
     attempt = 0
     
     while attempt < max_attempts:
+        logger.info(f"Polling attempt {attempt + 1}/{max_attempts} for job {job_id}...")
         try:
-            response = requests.get(status_url, headers=headers)
+            response = requests.get(status_url, headers=headers, timeout=30) # Timeout for status request
+            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
             
-            if response.status_code == 200:
-                job_status = response.json()
-                status = job_status.get('properties', {}).get('status')
-                
-                if status == 'Completed':
-                    logger.info(f"Job {job_id} completed")
-                    break
-                elif status in ['Failed', 'Suspended', 'Stopped']:
-                    logger.error(f"Job {job_id} ended with status: {status}")
-                    return None
-            else:
-                logger.error(f"Failed to get job status: {response.status_code} - {response.text}")
-            
-            # Wait before next attempt
-            time.sleep(15)
-            attempt += 1
-        
-        except Exception as e:
-            logger.error(f"Error polling job status: {str(e)}")
-            attempt += 1
-    
-    if attempt >= max_attempts:
-        logger.error(f"Max polling attempts reached for job {job_id}")
-        return None
-    
-    # Get job output - IMPORTANT: don't try to parse as JSON, return raw text
-    try:
-        response = requests.get(output_url, headers=headers)
-        
-        if response.status_code == 200:
-            # We can see from logs that we're getting plain text, not JSON
-            # So we'll get the raw text response rather than trying to parse JSON
-            raw_output = response.text
-            
-            # Log the first part of the output for debugging
-            logger.debug(f"Raw output from job (first 200 chars): {raw_output[:200]}")
-            
-            # Check if output contains PowerShell data
-            if "ComputerName" in raw_output and "Date" in raw_output:
-                # This appears to be valid PowerShell output
-                return raw_output
-            else:
-                # If we don't see the expected content, try JSON parsing as fallback
+            job_status_data = response.json()
+            status = job_status_data.get('properties', {}).get('status')
+            logger.info(f"Job {job_id} current status: {status}")
+
+            if status == 'Completed':
+                logger.info(f"Job {job_id} completed. Fetching output.")
+                # Fetch output
                 try:
-                    json_output = response.json()
-                    return json_output.get('value', '')
-                except:
-                    # Return whatever we got if JSON parsing fails
-                    return raw_output
-        else:
-            logger.error(f"Failed to get job output: {response.status_code} - {response.text}")
-            return None
-    
-    except Exception as e:
-        logger.error(f"Error getting job output: {str(e)}")
-        return None
+                    output_response = requests.get(output_url, headers=headers, timeout=60) # Longer timeout for output
+                    output_response.raise_for_status()
+                    # It's safer to return raw text as output can be varied. Parsing is done later.
+                    raw_output = output_response.text 
+                    logger.debug(f"Raw output received for job {job_id} (first 200 chars): {raw_output[:200]}")
+                    return raw_output # Return raw output string
+                except requests.exceptions.HTTPError as e_out:
+                    logger.error(f"HTTP error fetching output for completed job {job_id}: {e_out.response.status_code} - {e_out.response.text}")
+                    return "" # Return empty string if output fetching fails but job completed
+                except requests.exceptions.RequestException as e_out:
+                    logger.error(f"Request error fetching output for job {job_id}: {str(e_out)}")
+                    return "" # Return empty string on other request errors for output
+                except Exception as e_out:
+                    logger.error(f"Unexpected error fetching output for job {job_id}: {str(e_out)}")
+                    return ""
+
+            elif status in ['Failed', 'Suspended', 'Stopped']:
+                logger.error(f"Job {job_id} ended with unrecoverable status: {status}. Details: {job_status_data.get('properties', {}).get('exception', 'No exception details')}")
+                return None # Indicates job failure
+
+            # For other statuses like 'Running', 'Queued', etc., continue polling
+            
+        except requests.exceptions.HTTPError as e_stat:
+            logger.error(f"HTTP error polling status for job {job_id}: {e_stat.response.status_code} - {e_stat.response.text}")
+            # Depending on the error (e.g., 401 Unauthorized), retrying might be futile.
+            # For now, we continue retrying up to max_attempts.
+        except requests.exceptions.Timeout:
+            logger.warning(f"Timeout polling status for job {job_id} on attempt {attempt + 1}.")
+        except requests.exceptions.RequestException as e_stat: # Catch other request errors
+            logger.error(f"Request error polling status for job {job_id}: {str(e_stat)}")
+        except json.JSONDecodeError:
+            logger.error(f"Failed to decode JSON status response for job {job_id}. Response text: {response.text if 'response' in locals() else 'N/A'}")
+        except Exception as e_stat: # Catch any other unexpected error
+            logger.error(f"Unexpected error during job status poll for {job_id}: {str(e_stat)}")
+
+        attempt += 1
+        if attempt < max_attempts: # Only sleep if not the last attempt
+            time.sleep(poll_interval)
+
+    logger.error(f"Max polling attempts ({max_attempts}) reached for job {job_id}. Assuming job timed out or failed to complete in expected time.")
+    return None # Indicates timeout or persistent failure
 
 def get_azure_token():
-    """Get an Azure access token"""
     client_id = app.config['AZURE_CLIENT_ID']
     client_secret = app.config['AZURE_CLIENT_SECRET']
     tenant_id = app.config['AZURE_TENANT_ID']
     
+    if not all([client_id, client_secret, tenant_id]):
+        logger.error("Azure client ID, secret, or tenant ID is not configured. Cannot obtain token.")
+        return None
+
     token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/token"
-    
     payload = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "resource": "https://management.azure.com/"
+        "grant_type": "client_credentials", "client_id": client_id,
+        "client_secret": client_secret, "resource": "https://management.azure.com/"
     }
-    
     try:
-        response = requests.post(token_url, data=payload)
+        # Timeout for token request
+        response = requests.post(token_url, data=payload, timeout=20)
+        response.raise_for_status() # Raise HTTPError for bad responses
         
-        if response.status_code == 200:
-            return response.json().get('access_token')
-        else:
-            logger.error(f"Failed to get token: {response.status_code} - {response.text}")
+        token_data = response.json()
+        access_token = token_data.get('access_token')
+        if not access_token:
+            logger.error(f"Access token not found in response from Azure. Response: {token_data}")
             return None
-    
-    except Exception as e:
-        logger.error(f"Error getting Azure token: {str(e)}")
+        return access_token
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"Failed to get Azure token (HTTP error): {e.response.status_code} - {e.response.text}")
+        return None
+    except requests.exceptions.Timeout:
+        logger.error("Timeout attempting to get Azure token.")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error getting Azure token (RequestException): {str(e)}")
+        return None
+    except json.JSONDecodeError:
+        logger.error(f"Failed to decode JSON response when getting Azure token. Response: {response.text if 'response' in locals() else 'N/A'}")
+        return None
+    except Exception as e: # Catch any other unexpected error
+        logger.error(f"Unexpected error getting Azure token: {str(e)}")
         return None
 
 # --- Output Parsing ---
 
-def parse_job_output(output, server_name):
-    """Parse the job output and extract update information with detailed logging"""
-    logger.info(f"Parsing job output for {server_name}")
+def parse_job_output(job_output_text, server_name_fallback):
+    """
+    Parses the structured JSON output from the PowerShell runbook.
+    """
+    logger.info(f"Attempting to parse job output for server fallback: {server_name_fallback}")
     
-    # Default structure for results
-    results = {
-        "serverName": server_name,
-        "allUpdates": [],
-        "failedUpdates": [],
-        "totalUpdates": 0,
-        "hasFailures": False
+    # Default structure for results, mirroring PowerShell's $finalOutput
+    parsed_results = {
+        "serverName": server_name_fallback,
+        "executionStatus": "ParsingError", # Default if parsing fails
+        "errorMessage": "Failed to parse job output.",
+        "updateHistory": [],
+        "diagnosticChecks": {},
+        "timestampUTC": datetime.utcnow().isoformat(), # Timestamp of parsing
+        "rawOutputExcerpt": (job_output_text[:500] + "..." if len(job_output_text) > 500 else job_output_text) if job_output_text else "No output text received"
     }
-    
+
+    if not job_output_text or not job_output_text.strip():
+        logger.warning(f"No job output text to parse for {server_name_fallback}.")
+        parsed_results["errorMessage"] = "No job output text received from runbook."
+        return parsed_results
+
     try:
-        if not output:
-            logger.warning(f"No output to parse for {server_name}")
-            return results
+        # The entire output from PowerShell is expected to be a single JSON object
+        data = json.loads(job_output_text)
         
-        # Log a sample of the output for debugging
-        output_length = len(output)
-        logger.info(f"Output length: {output_length} characters")
+        # Overwrite defaults with data from PowerShell if available
+        parsed_results["serverName"] = data.get("ComputerName", server_name_fallback)
+        parsed_results["executionStatus"] = data.get("ExecutionStatus", "UnknownStatusFromScript")
+        parsed_results["errorMessage"] = data.get("ErrorMessage") # Can be null if success
+        parsed_results["timestampUTC"] = data.get("TimestampUTC", parsed_results["timestampUTC"]) # Use PS timestamp if available
         
-        sample_size = min(1000, output_length)
-        sample = output[:sample_size]
-        logger.info(f"Output sample (first {sample_size} chars):\n{sample}...")
+        # Update History
+        # The PowerShell script already formats UpdateHistory nicely.
+        # We just need to ensure it's a list and handle potential nulls.
+        update_history_from_ps = data.get("UpdateHistory")
+        if isinstance(update_history_from_ps, list):
+            parsed_results["updateHistory"] = update_history_from_ps
+        elif update_history_from_ps is not None: # If it's not a list but not null, log warning
+            logger.warning(f"UpdateHistory from PowerShell for {parsed_results['serverName']} was not a list: {type(update_history_from_ps)}")
+            parsed_results["updateHistory"] = [] # Default to empty list
         
-        # Get server name from output if present
-        if "Received ComputerName:" in output:
-            server_match = re.search(r"Received ComputerName:\s*([^\n]+)", output)
-            if server_match and server_match.group(1).strip():
-                results["serverName"] = server_match.group(1).strip()
-                logger.info(f"Found server name in output: {results['serverName']}")
+        # Diagnostic Checks
+        diagnostic_checks_from_ps = data.get("DiagnosticChecks")
+        if isinstance(diagnostic_checks_from_ps, dict):
+            parsed_results["diagnosticChecks"] = diagnostic_checks_from_ps
+        elif diagnostic_checks_from_ps is not None:
+            logger.warning(f"DiagnosticChecks from PowerShell for {parsed_results['serverName']} was not a dict: {type(diagnostic_checks_from_ps)}")
+            parsed_results["diagnosticChecks"] = {}
 
-        # Look for failure indicators directly in the raw output
-        failure_terms = ["Failed", "Error", "Failure", "failed", "error", "failure"]
-        raw_failure_indicators = [term for term in failure_terms if term in output]
-        
-        if raw_failure_indicators:
-            logger.info(f"Found potential failure indicators in raw output: {raw_failure_indicators}")
-            
-            # Extract some context around failures for debugging
-            for term in raw_failure_indicators:
-                matches = re.finditer(term, output)
-                for match in matches:
-                    pos = match.start()
-                    start = max(0, pos - 100)
-                    end = min(output_length, pos + 100)
-                    context = output[start:end].replace('\n', ' ')
-                    logger.info(f"Failure context: '...{context}...'")
+        # Aggregate update counts for convenience, similar to the old flat structure's needs
+        # This part is more about preparing for the `generate_ai_report` function's existing expectations
+        # if we want to keep its prompt generation logic similar.
+        parsed_results["allUpdates"] = parsed_results["updateHistory"] # For compatibility with old report prompt
+        parsed_results["totalUpdates"] = len(parsed_results["updateHistory"])
+        parsed_results["failedUpdates"] = [
+            upd for upd in parsed_results["updateHistory"] 
+            if isinstance(upd, dict) and "fail" in upd.get("Status", "").lower()
+        ]
+        parsed_results["hasFailures"] = len(parsed_results["failedUpdates"]) > 0 or \
+                                       "fail" in parsed_results["executionStatus"].lower() or \
+                                       "error" in parsed_results["executionStatus"].lower()
 
-        # Parse updates using a simpler approach - split by date entries
-        updates = []
-        
-        # Split the output into blocks based on Date headers
-        blocks = re.split(r"\nDate\s+:", output)
-        
-        logger.info(f"Found {len(blocks)} update blocks in output")
-        
-        # Process each block (skip the first one which is the header)
-        for i, block in enumerate(blocks[1:] if len(blocks) > 1 else []):
-            # Reinsert the "Date:" prefix that got removed by the split
-            block_text = "Date    : " + block.strip()
-            
-            try:
-                # Extract fields using simple pattern matching
-                date_match = re.search(r"Date\s+:\s+([^\n]+)", block_text)
-                operation_match = re.search(r"Operation\s+:\s+([^\n]+)", block_text)
-                status_match = re.search(r"Status\s+:\s+([^\n]+)", block_text)
-                update_match = re.search(r"Update\s+:\s+([^\n]+)", block_text)
-                title_match = re.search(r"Title\s+:\s+([^\n]+)", block_text)
-                
-                if date_match and status_match:  # Require at least date and status
-                    update_info = {
-                        "date": date_match.group(1).strip(),
-                        "operation": operation_match.group(1).strip() if operation_match else "",
-                        "status": status_match.group(1).strip(),
-                        "update": update_match.group(1).strip() if update_match else "",
-                        "title": title_match.group(1).strip() if title_match else ""
-                    }
-                    
-                    # Log each parsed update
-                    logger.info(f"Parsed update block {i+1}: {json.dumps(update_info)}")
-                    
-                    # Detect failures and log them prominently
-                    if "Failed" in update_info.get("status", ""):
-                        logger.warning(f"FAILURE DETECTED in update: {json.dumps(update_info)}")
-                    
-                    updates.append(update_info)
-                else:
-                    logger.warning(f"Skipping block {i+1} - missing required fields")
-                    logger.debug(f"Incomplete block content: {block_text[:200]}...")
-            except Exception as e:
-                logger.error(f"Error parsing update block {i+1}: {str(e)}")
-                logger.debug(f"Problematic block content: {block_text[:200]}...")
-                continue
-        
-        # Store all updates
-        results["allUpdates"] = updates
-        results["totalUpdates"] = len(updates)
-        
-        # Find failed updates
-        failed_updates = [u for u in updates if "Failed" in u.get("status", "")]
-        results["failedUpdates"] = failed_updates
-        results["hasFailures"] = len(failed_updates) > 0
-        
-        # Log the final results summary
-        logger.info(f"Parsed {len(updates)} updates for {server_name}, {len(failed_updates)} failed")
-        if failed_updates:
-            logger.warning(f"Server {server_name} has {len(failed_updates)} failed updates")
-            for i, failed in enumerate(failed_updates):
-                logger.warning(f"  Failed update {i+1}: {json.dumps(failed)}")
-        
-        return results
-    
+        logger.info(f"Successfully parsed structured job output for {parsed_results['serverName']}. Execution Status: {parsed_results['executionStatus']}")
+        if parsed_results["errorMessage"]:
+            logger.warning(f"Error message from script for {parsed_results['serverName']}: {parsed_results['errorMessage']}")
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to decode JSON from job output for {server_name_fallback}: {e}")
+        parsed_results["errorMessage"] = f"Output was not valid JSON: {e}. Raw output excerpt in 'rawOutputExcerpt'."
+        # Keep rawOutputExcerpt already set
     except Exception as e:
-        logger.error(f"Error parsing job output: {str(e)}")
-        logger.exception("Detailed traceback:")
-        return results  # Return default results
+        logger.error(f"Unexpected error parsing job output for {server_name_fallback}: {e}")
+        logger.exception("Detailed traceback for parse_job_output error:")
+        parsed_results["errorMessage"] = f"General parsing error: {e}. Raw output excerpt in 'rawOutputExcerpt'."
+        # Keep rawOutputExcerpt already set
+
+    return parsed_results
+
 
 # --- Results Processing ---
 
 def check_all_complete():
-    """Check if all machines are processed and generate a report"""
-    if ACTIVE_JOBS:
-        # Still have active jobs
+    # This function is called after each job finishes or fails.
+    # It checks if there are any jobs still active.
+    if APP_STATE["active_jobs"]:
+        logger.info(f"{len(APP_STATE['active_jobs'])} job(s) still active. Report generation deferred.")
         return
+
+    # No active jobs, proceed if there are server results to report on.
+    if not APP_STATE["server_results"]:
+        logger.info("All jobs complete, but no server results to report for this batch.")
+        # APP_STATE["completed_jobs"] is NOT cleared here, so they persist for UI display
+        # until explicitly cleared by user or full reset.
+        return 
     
-    if not SERVER_RESULTS:
-        # No results to process
-        return
-    
-    logger.info("All machines processed, generating report")
-    
+    logger.info("All jobs complete for the current batch and server results are present. Aggregating and generating report.")
     try:
-        # Aggregate results
+        # Create a snapshot of the results for this report run
+        current_server_results = list(APP_STATE["server_results"]) # Make a copy
+        
         aggregate_results = {
-            "serverResults": SERVER_RESULTS,
-            "totalServers": len(SERVER_RESULTS),
-            "serversWithFailures": len([s for s in SERVER_RESULTS if s.get("hasFailures", False)]),
-            "totalFailedUpdates": sum(len(s.get("failedUpdates", [])) for s in SERVER_RESULTS)
+            "serverResults": current_server_results,
+            "totalServers": len(current_server_results),
+            "serversWithFailures": len([s for s in current_server_results if s.get("hasFailures", False) or "fail" in s.get("executionStatus","").lower() or "error" in s.get("executionStatus","").lower()]),
+            "totalFailedUpdates": sum(len(s.get("failedUpdates", [])) for s in current_server_results)
         }
         
-        # Start a separate thread for report generation and email sending
-        # This prevents timeouts from blocking the main application
-        threading.Thread(
-            target=generate_and_send_report,
-            args=(aggregate_results,),
-            daemon=True
-        ).start()
+        # Generate and send report in a background thread to avoid blocking
+        threading.Thread(target=generate_and_send_report, args=(aggregate_results,), daemon=True).start()
+        logger.info("Report generation and sending initiated in a background thread.")
         
-        logger.info("Report generation started in background thread")
-    
-    except Exception as e:
-        logger.error(f"Error in check_all_complete: {str(e)}")
+        # Clear ONLY server_results for the next batch. Completed_jobs persist.
+        APP_STATE["server_results"].clear()
+        logger.info("Live server_results cleared after initiating report for current batch. Completed_jobs persist for UI.")
 
-def generate_and_send_report(aggregate_results):
-    """Generate a report and send email in a separate thread"""
-    try:
-        # Generate report using AI
-        logger.info("Generating AI report in background thread")
-        report = generate_ai_report(aggregate_results)
-        
-        # Send email notification
-        logger.info("Sending email notification with generated report")
-        send_email_notification(report)
-        
-        # Clear results for next run
-        SERVER_RESULTS.clear()
-        
-        # Log the completion
-        logger.info("Report generated and email sent")
-        
     except Exception as e:
-        logger.error(f"Error in generate_and_send_report: {str(e)}")
-        logger.exception("Detailed traceback:")
-        
-        # Try to send a fallback email if AI report generation failed
+        logger.error(f"Error in check_all_complete while preparing for report generation: {str(e)}")
+        logger.exception("Detailed traceback for check_all_complete error:")
+        # Attempt to clear server_results even on error to prevent stale data build-up for next batch.
+        APP_STATE["server_results"].clear()
+        logger.warning("Cleared server_results after error in check_all_complete.")
+
+
+def generate_and_send_report(aggregate_results_snapshot):
+    """Generates AI report and sends email. Operates on a snapshot of results."""
+    report_content = "Error: Report generation failed." # Default error report
+    try:
+        logger.info("Background thread: Generating AI report.")
+        # Pass the snapshot to generate_ai_report
+        report_content = generate_ai_report(aggregate_results_snapshot) 
+        logger.info("Background thread: AI Report generated. Attempting to send email.")
+        send_email_notification(report_content)
+        logger.info("Background thread: Email notification sent successfully.")
+    except Exception as e:
+        logger.error(f"Background thread: Error during report generation or email sending: {str(e)}")
+        logger.exception("Detailed traceback for generate_and_send_report background thread:")
+        # Try to send a fallback email with whatever report content was generated (or error message)
+        # or a template report if AI generation failed badly.
         try:
-            fallback_report = generate_template_report(aggregate_results)
-            fallback_report = "ERROR: AI report generation failed. Using template report instead.\n\n" + fallback_report
-            send_email_notification(fallback_report)
-            logger.info("Fallback report sent due to error in AI report generation")
+            if "Error: Report generation failed." in report_content or not report_content.strip():
+                logger.info("Background thread: AI report generation seems to have failed, using template for fallback email.")
+                fallback_report_content = "ERROR: AI report generation failed or an error occurred during the main report process. A template-based summary is provided below.\n\n"
+                fallback_report_content += generate_template_report(aggregate_results_snapshot) # Use snapshot
+            else:
+                # An error occurred after report_content was (partially) generated.
+                fallback_report_content = "NOTICE: An error occurred after the initial report generation. The report content below might be incomplete or reflect the state before the error.\n\n" + report_content
+            
+            send_email_notification(fallback_report_content)
+            logger.info("Background thread: Fallback email notification sent.")
         except Exception as email_error:
-            logger.error(f"Failed to send fallback email: {str(email_error)}")
+            logger.error(f"Background thread: Failed to send fallback email notification: {str(email_error)}")
+    finally:
+        logger.info("Background thread: generate_and_send_report task finished.")
+        # APP_STATE["server_results"] and APP_STATE["completed_jobs"] are cleared by check_all_complete
+        # after this thread is spawned. This function operates on a snapshot.
+
 
 # --- AI Integration ---
-
-def generate_ai_report(results):
-    """Generate a report using AI with better fallback handling and detailed logging"""
-    logger.info("Generating AI report")
-    
+def generate_ai_report(results_snapshot):
+    logger.info("Generating AI report...")
     try:
-        # Prepare the prompt
-        prompt = "You are a system administrator assistant analyzing Windows update information.\n\n"
-        prompt += "Review the following update data from all servers:\n\n"
+        server_results_data = results_snapshot.get("serverResults", [])
+
+        if not server_results_data:
+            logger.warning("No server results data in snapshot to generate AI report from. Using template.")
+            return generate_template_report(results_snapshot)
+
+        prompt = "You are a system administrator assistant analyzing Windows update and server health information.\n\n"
+        prompt += "Review the following data from all processed servers:\n\n"
         
-        # Check if we have valid server results
-        if not results or not results.get("serverResults"):
-            logger.warning("No server results to generate report")
-            return generate_template_report(results)
+        servers_with_issues = 0 # Broadened from just update failures
+        total_failed_updates_count = 0
         
-        # Count servers with failures for validation
-        servers_with_failures = 0
-        total_failed_updates = 0
-        
-        for server in results.get("serverResults", []):
-            has_failures = server.get("hasFailures", False)
-            if has_failures:
-                servers_with_failures += 1
-                total_failed_updates += len(server.get("failedUpdates", []))
+        for server_data in server_results_data:
+            server_name = server_data.get("serverName", "Unknown Server")
+            execution_status = server_data.get("executionStatus", "Unknown")
+            error_message_from_script = server_data.get("errorMessage")
+            update_history = server_data.get("updateHistory", [])
+            failed_updates_on_server = server_data.get("failedUpdates", [])
+            diagnostics = server_data.get("diagnosticChecks", {})
             
-            has_failures_str = "Yes" if has_failures else "No"
-            prompt += f"## Server: {server.get('serverName', 'Unknown')}\n"
-            prompt += f"Failed Updates: {has_failures_str}\n\n"
+            current_server_has_issues = False
+            if "fail" in execution_status.lower() or "error" in execution_status.lower() or error_message_from_script:
+                current_server_has_issues = True
+            if failed_updates_on_server:
+                current_server_has_issues = True
+                total_failed_updates_count += len(failed_updates_on_server)
             
-            if has_failures:
-                prompt += "The following updates failed:\n\n"
-                for update in server.get("failedUpdates", []):
-                    prompt += f"- Date: {update.get('date', 'Unknown')}\n"
-                    prompt += f"  - Update: {update.get('update', 'Unknown')}\n"
-                    prompt += f"  - Title: {update.get('title', 'Unknown')}\n\n"
+            # Check diagnostic statuses for issues
+            disk_c_status = diagnostics.get("DiskC", {}).get("Status", "OK")
+            if "low" in disk_c_status.lower() or "error" in disk_c_status.lower():
+                current_server_has_issues = True
+            
+            pending_reboot_info = diagnostics.get("PendingReboot", {})
+            if pending_reboot_info.get("IsPending") == True: # Explicitly check for True
+                current_server_has_issues = True
+
+            arc_conn_status = diagnostics.get("ArcConnectivity", {}).get("Status", "OK")
+            if "issues" in arc_conn_status.lower() or "error" in arc_conn_status.lower():
+                current_server_has_issues = True
+            
+            cbs_log_status = diagnostics.get("CBSLog", {}).get("Status", "NoObviousErrors")
+            if "issuesfound" in cbs_log_status.lower() or "error" in cbs_log_status.lower(): # "PotentialIssuesFound"
+                current_server_has_issues = True
+
+            service_checks = diagnostics.get("Services", {})
+            for service_name, service_info in service_checks.items():
+                if isinstance(service_info, dict) and service_info.get("Status") != "Running" and service_info.get("Status") != "NotFound": # NotFound is ok if service is optional
+                    current_server_has_issues = True
+                    break 
+            
+            if current_server_has_issues:
+                servers_with_issues += 1
+
+            prompt += f"## Server: {server_name}\n"
+            prompt += f"- Overall Execution Status: {execution_status}\n"
+            if error_message_from_script:
+                prompt += f"- Script Error Message: {error_message_from_script}\n"
+
+            # Update History Summary for this server
+            prompt += f"- Update History (Last {len(update_history)} relevant entries):\n"
+            if update_history:
+                for upd in update_history:
+                    prompt += f"  - Date: {upd.get('Date', 'N/A')}, Status: {upd.get('Status', 'N/A')}, KB: {upd.get('UpdateKB', 'N/A')}, Title: {upd.get('Title', 'N/A')}\n"
+                if failed_updates_on_server:
+                    prompt += f"  - FAILED UPDATES ON THIS SERVER: {len(failed_updates_on_server)}\n"
             else:
-                prompt += "No updates failed on this server.\n\n"
+                prompt += "  - No relevant update history found or provided.\n"
+
+            # Diagnostic Checks Summary for this server
+            prompt += "- Diagnostic Checks:\n"
+            prompt += f"  - Disk C: Status: {disk_c_status}, Details: {diagnostics.get('DiskC', {}).get('Details', 'N/A')}\n"
+            
+            reboot_details = pending_reboot_info.get('Details', 'N/A')
+            prompt += f"  - Pending Reboot: {'Yes' if pending_reboot_info.get('IsPending') else 'No'}. Reasons: {reboot_details if pending_reboot_info.get('IsPending') else 'N/A'}\n"
+
+            prompt += f"  - Azure Arc Connectivity: Status: {arc_conn_status}, Details: {diagnostics.get('ArcConnectivity', {}).get('Details', 'N/A')}\n"
+            if diagnostics.get("ArcConnectivity", {}).get("UnreachableCoreEndpoints"):
+                prompt += f"    - Unreachable Arc Endpoints: {', '.join(diagnostics['ArcConnectivity']['UnreachableCoreEndpoints'])}\n"
+
+            prompt += f"  - CBS Log: Status: {cbs_log_status}, Findings: {diagnostics.get('CBSLog', {}).get('Findings', 'N/A')}\n"
+            if diagnostics.get("CBSLog", {}).get("ExampleErrorLines"):
+                 prompt += f"    - CBS Log Excerpts: {'; '.join(diagnostics['CBSLog']['ExampleErrorLines'])}\n"
+            
+            prompt += "  - Monitored Services:\n"
+            for service_name, service_info in service_checks.items():
+                if isinstance(service_info, dict): # Ensure it's a dict
+                    prompt += f"    - {service_name}: Status: {service_info.get('Status', 'N/A')}, StartType: {service_info.get('StartType', 'N/A')}\n"
+            prompt += "\n" # Newline after each server's block
+
+        prompt += f"\n## Overall Summary Across All Servers ({len(server_results_data)} Processed):\n"
+        prompt += f"- Servers with any reported issues (update failures, diagnostic warnings, or script errors): {servers_with_issues}\n"
+        prompt += f"- Total specific Windows Update installation failures recorded: {total_failed_updates_count}\n\n"
         
-        # Add explicit summary statistics to make it clearer to the AI
-        prompt += "\n## Summary Statistics:\n"
-        prompt += f"- Total Servers: {len(results.get('serverResults', []))}\n"
-        prompt += f"- Servers With Failures: {servers_with_failures}\n"
-        prompt += f"- Total Failed Updates: {total_failed_updates}\n\n"
+        prompt += "Please provide a concise executive summary. Start by stating the total number of servers processed and how many had any issues. "
+        prompt += "Then, for each server with issues, briefly list the server name and the key problems (e.g., 'Update KB123 failed', 'Low Disk Space', 'Arc Unreachable', 'Service X not running'). "
+        prompt += "Conclude with clear, actionable recommendations for addressing the identified problems, prioritizing critical issues. "
+        prompt += "If no issues were detected on any server, state this clearly.\n"
+        prompt += "\nIMPORTANT: If any servers had issues, ensure these are explicitly mentioned. Do not state 'no issues' if any server reported problems."
         
-        prompt += "\nPlease provide a concise summary of all Windows update results, highlighting any failed updates across all servers. "
-        prompt += "Include the total number of servers scanned, how many had failed updates, and provide recommendations on what actions should be taken next."
-        prompt += "\nIMPORTANT: If any servers had failures, clearly identify them and never state that no failures were detected."
+        logger.info(f"AI Prompt (length: {len(prompt)} chars). Preview (first 500):\n{prompt[:500]}...")
         
-        # Log the prompt length for debugging
-        logger.info(f"AI Prompt (length: {len(prompt)}):\n{prompt}")
-        
-        # Choose AI integration method based on configuration
-        ai_provider = app.config.get('AI_PROVIDER', 'template').lower()
+        ai_provider = app.config.get('AI_PROVIDER', 'template').lower() 
         logger.info(f"Using AI provider: {ai_provider}")
         
+        actual_has_any_issues = servers_with_issues > 0
+
         if ai_provider == 'openai':
-            return generate_openai_report(prompt)
+            return generate_openai_report(prompt, actual_has_any_issues)
         elif ai_provider == 'ollama':
-            # THIS IS THE IMPORTANT CHANGE - Check if your generate_ollama_report takes 1 or 2 parameters
-            # Option 1: If your generate_ollama_report takes only 1 parameter
-            return generate_ollama_report(prompt)
-            
-            # Option 2: If you've updated generate_ollama_report to take 2 parameters
-            # return generate_ollama_report(prompt, servers_with_failures > 0)
+            return generate_ollama_report(prompt, actual_has_any_issues)
+        elif ai_provider == 'vllm':
+            return generate_vllm_report(prompt, actual_has_any_issues)
         else:
-            # Fallback to a simple template if no AI
-            logger.info(f"Using template report (AI provider '{ai_provider}' not configured)")
-            return generate_template_report(results)
+            logger.info(f"AI provider '{ai_provider}' not configured or unknown. Using template report.")
+            return generate_template_report(results_snapshot) 
     
     except Exception as e:
         logger.error(f"Error generating AI report: {str(e)}")
-        logger.exception("Detailed traceback:")
-        return generate_template_report(results)
+        logger.exception("Detailed traceback for AI report generation error:")
+        return generate_template_report(results_snapshot) 
 
-def generate_ollama_report(prompt):
+
+def _validate_ai_response(ai_generated_text, model_name, provider_name, actual_has_issues): # Changed parameter name
+    """Helper function to validate AI response regarding issue reporting."""
+    if actual_has_issues: # Check if any issues were present
+        # Keywords to look for if issues were expected to be mentioned
+        issue_keywords = ["fail", "failed", "failure", "unsuccessful", "error", "issue", "problem", "warning", "critical", "unreachable", "low space", "not running"]
+        if not any(keyword in ai_generated_text.lower() for keyword in issue_keywords):
+            warning_message = (
+                f"⚠️ AI VALIDATION NOTICE: Issues were present in the data, but the AI summary from "
+                f"{provider_name} model '{model_name}' might not have explicitly acknowledged them. "
+                f"Please review detailed logs and the AI output carefully. ⚠️\n\n"
+            )
+            logger.warning(f"AI Validation: {provider_name} model '{model_name}' response seems to miss issue mentions when issues exist.")
+            return warning_message + ai_generated_text
+    return ai_generated_text
+
+def generate_ollama_report(prompt, actual_has_issues): # Changed parameter name
     """Generate a report using Ollama with enhanced logging and validation"""
-    try:
-        # Check if the prompt indicates there are failures
-        has_failures_flag = "Servers With Failures: 0" not in prompt and "Failed Updates: Yes" in prompt
-        
-        ollama_url = app.config.get('OLLAMA_URL', 'http://host.docker.internal:11434/api/generate')
-        ollama_model = app.config.get('OLLAMA_MODEL', 'mistral')
-        
-        logger.info(f"Connecting to Ollama at: {ollama_url}")
-        logger.info(f"Using model: {ollama_model}")
-        
-        # Log request parameters
-        request_body = {
-            "model": ollama_model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.2,  # Lower temperature for more consistent responses
-                "top_p": 0.9
-            }
-        }
-        logger.info(f"Ollama request parameters: model={ollama_model}, prompt_length={len(prompt)}")
-        
-        # Add longer timeout for large prompts
-        start_time = time.time()
-        logger.info(f"Sending request to Ollama using model '{ollama_model}'...")
-        
-        response = requests.post(
-            ollama_url,
-            json=request_body,
-            timeout=1200 # 2 minute timeout
-        )
-        
-        request_time = time.time() - start_time
-        logger.info(f"Ollama request completed in {request_time:.2f} seconds")
-        
-        # Log the response status
-        logger.info(f"Ollama response status code: {response.status_code}")
-        
-        if response.status_code == 200:
-            # Parse the JSON response
-            try:
-                json_response = response.json()
-                result = json_response.get('response', '')
-                logger.info(f"Successfully generated report with model '{ollama_model}' (length: {len(result)})")
-                
-                # Validate the response content if we know there are failures
-                if has_failures_flag:
-                    # Check if the response correctly mentions failures
-                    failure_terms = ["fail", "failed", "failure", "unsuccessful", "error", "issues"]
-                    found_failure_mention = any(term in result.lower() for term in failure_terms)
-                    
-                    if not found_failure_mention:
-                        logger.warning(f"VALIDATION FAILED: Model '{ollama_model}' didn't mention failures when they exist!")
-                        logger.warning("Adding a correction to the report...")
-                        
-                        # Add a correction notice
-                        result = (
-                            f"⚠️ CORRECTION: The system detected failed updates, but the AI summary "
-                            f"from model '{ollama_model}' did not properly acknowledge them. Please check the detailed logs. ⚠️\n\n"
-                        ) + result
-                
-                return result
-            except Exception as e:
-                logger.error(f"Error parsing Ollama JSON response: {str(e)}")
-                return generate_template_report({"serverResults": []})
-        else:
-            logger.error(f"Ollama error with model '{ollama_model}': {response.status_code}")
-            
-            # Handle common errors specifically
-            if response.status_code == 404:
-                error_message = f"Model '{ollama_model}' not found on Ollama server"
-                logger.error(error_message)
-                return f"ERROR: {error_message}\n\n" + generate_template_report({"serverResults": []})
-            elif response.status_code == 500:
-                error_message = f"Internal server error from Ollama with model '{ollama_model}'"
-                logger.error(error_message)
-                return f"ERROR: {error_message}\n\n" + generate_template_report({"serverResults": []})
-            
-            return generate_template_report({"serverResults": []})
+    ollama_url = app.config.get('OLLAMA_URL', 'http://host.docker.internal:11434/api/generate')
+    ollama_model = app.config.get('OLLAMA_MODEL', 'mistral')
+    logger.info(f"Connecting to Ollama at: {ollama_url} with model: {ollama_model}")
     
-    except Exception as e:
-        logger.error(f"Error with Ollama: {str(e)}")
-        logger.exception("Detailed traceback:")
-        # Fall back to template report
-        return f"ERROR connecting to Ollama: {str(e)}\n\n" + generate_template_report({"serverResults": []})
+    request_body = {
+        "model": ollama_model, "prompt": prompt, "stream": False,
+        "options": {"temperature": 0.2, "top_p": 0.9} 
+    }
+    logger.debug(f"Ollama request body: {json.dumps(request_body, indent=2)}") 
 
-def generate_openai_report(prompt):
-    """Generate a report using OpenAI"""
     try:
-        openai.api_key = app.config['OPENAI_API_KEY']
+        start_time = time.time()
+        response = requests.post(ollama_url, json=request_body, timeout=180) 
+        request_time = time.time() - start_time
+        logger.info(f"Ollama request to model '{ollama_model}' completed in {request_time:.2f}s. Status: {response.status_code}")
         
-        response = openai.chat.completions.create(
-            model=app.config.get('OPENAI_MODEL', 'gpt-3.5-turbo'),
+        response.raise_for_status() 
+        
+        json_response = response.json()
+        result = json_response.get('response', '')
+        if not result.strip():
+            logger.warning(f"Ollama model '{ollama_model}' returned an empty response.")
+            return "ERROR: Ollama returned an empty response.\n\n" + generate_template_report({"serverResults": []}) 
+
+        logger.info(f"Ollama report generated (length: {len(result)}). First 100 chars: {result[:100]}")
+        return _validate_ai_response(result, ollama_model, "Ollama", actual_has_issues) # Pass actual_has_issues
+
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"Ollama HTTP error (model '{ollama_model}'): {e.response.status_code} - {e.response.text[:500]}")
+        error_message = f"Ollama API error (model: {ollama_model}, status: {e.response.status_code}). "
+        if e.response.status_code == 404: error_message += f"Model '{ollama_model}' not found or API endpoint incorrect."
+        else: error_message += "Check Ollama server logs and connectivity."
+        return f"ERROR: {error_message}\n\n" + generate_template_report({"serverResults": []})
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout connecting to Ollama (model '{ollama_model}') at {ollama_url}.")
+        return f"ERROR: Timeout connecting to Ollama AI service.\n\n" + generate_template_report({"serverResults": []})
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error connecting to Ollama (model '{ollama_model}'): {str(e)}")
+        return f"ERROR: Cannot connect to Ollama AI service ({str(e)}).\n\n" + generate_template_report({"serverResults": []})
+    except json.JSONDecodeError as e:
+        logger.error(f"Error parsing Ollama JSON response (model '{ollama_model}'): {str(e)}. Response text: {response.text[:500] if 'response' in locals() else 'N/A'}")
+        return f"ERROR: Malformed response from Ollama.\n\n" + generate_template_report({"serverResults": []})
+    except Exception as e:
+        logger.error(f"General error with Ollama (model '{ollama_model}'): {str(e)}")
+        logger.exception("Detailed traceback for Ollama error:")
+        return f"ERROR: An unexpected error occurred with Ollama AI service.\n\n" + generate_template_report({"serverResults": []})
+
+
+def generate_openai_report(prompt, actual_has_issues): # Changed parameter name
+    openai.api_key = app.config.get('OPENAI_API_KEY')
+    openai_model = app.config.get('OPENAI_MODEL', 'gpt-3.5-turbo')
+
+    if not openai.api_key or openai.api_key == 'your-openai-api-key':
+        logger.error("OpenAI API key is not configured.")
+        return "ERROR: OpenAI API key not configured.\n\n" + generate_template_report({"serverResults": []})
+
+    logger.info(f"Generating report with OpenAI model: {openai_model}")
+    try:
+        start_time = time.time()
+        client = openai.OpenAI(api_key=openai.api_key)
+        response = client.chat.completions.create(
+            model=openai_model,
             messages=[
-                {"role": "system", "content": "You are a system administrator expert analyzing Windows updates."},
+                {"role": "system", "content": "You are a system administrator expert analyzing Windows updates and server health. Provide clear, concise, and actionable summaries."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
-            max_tokens=1000
+            max_tokens=2000 # Increased for more detailed diagnostic reporting
         )
-        
-        return response.choices[0].message.content
-    
-    except Exception as e:
-        logger.error(f"Error with OpenAI: {str(e)}")
-        return f"Error generating AI report: {str(e)}"
-
-def generate_ollama_report(prompt):
-    """Generate a report using Ollama with enhanced logging and validation"""
-    try:
-        # Check if the prompt indicates there are failures
-        has_failures_flag = "Servers With Failures: 0" not in prompt and "Failed Updates: Yes" in prompt
-        
-        ollama_url = app.config.get('OLLAMA_URL', 'http://host.docker.internal:11434/api/generate')
-        ollama_model = app.config.get('OLLAMA_MODEL', 'mistral')
-        
-        logger.info(f"Connecting to Ollama at: {ollama_url}")
-        logger.info(f"Using model: {ollama_model}")
-        
-        # Log request parameters
-        request_body = {
-            "model": ollama_model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.2,  # Lower temperature for more consistent responses
-                "top_p": 0.9
-            }
-        }
-        logger.info(f"Ollama request parameters: model={ollama_model}, prompt_length={len(prompt)}")
-        
-        # Add longer timeout for large prompts
-        start_time = time.time()
-        logger.info(f"Sending request to Ollama using model '{ollama_model}'...")
-        
-        response = requests.post(
-            ollama_url,
-            json=request_body,
-            timeout=1200  # 2 minute timeout
-        )
-        
         request_time = time.time() - start_time
-        logger.info(f"Ollama request completed in {request_time:.2f} seconds")
-        
-        # Log the response status
-        logger.info(f"Ollama response status code: {response.status_code}")
-        
-        if response.status_code == 200:
-            # Parse the JSON response
-            try:
-                json_response = response.json()
-                result = json_response.get('response', '')
-                logger.info(f"Successfully generated report with model '{ollama_model}' (length: {len(result)})")
-                
-                # Validate the response content if we know there are failures
-                if has_failures_flag:
-                    # Check if the response correctly mentions failures
-                    failure_terms = ["fail", "failed", "failure", "unsuccessful", "error", "issues"]
-                    found_failure_mention = any(term in result.lower() for term in failure_terms)
-                    
-                    if not found_failure_mention:
-                        logger.warning(f"VALIDATION FAILED: Model '{ollama_model}' didn't mention failures when they exist!")
-                        logger.warning("Adding a correction to the report...")
-                        
-                        # Add a correction notice
-                        result = (
-                            f"⚠️ CORRECTION: The system detected failed updates, but the AI summary "
-                            f"from model '{ollama_model}' did not properly acknowledge them. Please check the detailed logs. ⚠️\n\n"
-                        ) + result
-                
-                return result
-            except Exception as e:
-                logger.error(f"Error parsing Ollama JSON response: {str(e)}")
-                return generate_template_report({"serverResults": []})
-        else:
-            logger.error(f"Ollama error with model '{ollama_model}': {response.status_code}")
-            
-            # Handle common errors specifically
-            if response.status_code == 404:
-                error_message = f"Model '{ollama_model}' not found on Ollama server"
-                logger.error(error_message)
-                return f"ERROR: {error_message}\n\n" + generate_template_report({"serverResults": []})
-            elif response.status_code == 500:
-                error_message = f"Internal server error from Ollama with model '{ollama_model}'"
-                logger.error(error_message)
-                return f"ERROR: {error_message}\n\n" + generate_template_report({"serverResults": []})
-            
-            return generate_template_report({"serverResults": []})
-    
-    except Exception as e:
-        logger.error(f"Error with Ollama: {str(e)}")
-        logger.exception("Detailed traceback:")
-        # Fall back to template report
-        return f"ERROR connecting to Ollama: {str(e)}\n\n" + generate_template_report({"serverResults": []})
+        logger.info(f"OpenAI request completed in {request_time:.2f}s.")
 
-def generate_template_report(results):
-    """Generate a basic report without AI"""
-    total_servers = results.get("totalServers", 0)
-    servers_with_failures = results.get("serversWithFailures", 0)
-    total_failed_updates = results.get("totalFailedUpdates", 0)
+        report_content = response.choices[0].message.content
+        if not report_content.strip():
+             logger.warning(f"OpenAI model '{openai_model}' returned an empty response.")
+             return "ERROR: OpenAI returned an empty response.\n\n" + generate_template_report({"serverResults": []})
+
+        logger.info(f"OpenAI report generated (length: {len(report_content)}). First 100 chars: {report_content[:100]}")
+        return _validate_ai_response(report_content, openai_model, "OpenAI", actual_has_issues) # Pass actual_has_issues
+
+    except openai.APIConnectionError as e:
+        logger.error(f"OpenAI API Connection Error: {str(e)}")
+        return f"ERROR: Failed to connect to OpenAI API: {str(e)}\n\n" + generate_template_report({"serverResults": []})
+    except openai.RateLimitError as e:
+        logger.error(f"OpenAI Rate Limit Error: {str(e)}")
+        return f"ERROR: OpenAI API rate limit exceeded: {str(e)}\n\n" + generate_template_report({"serverResults": []})
+    except openai.APIStatusError as e: 
+        logger.error(f"OpenAI API Status Error: Status {e.status_code}, Response: {e.response}")
+        return f"ERROR: OpenAI API returned an error (Status {e.status_code}): {e.message}\n\n" + generate_template_report({"serverResults": []})
+    except Exception as e: 
+        logger.error(f"Unexpected error with OpenAI: {str(e)}")
+        logger.exception("Detailed traceback for OpenAI error:")
+        return f"ERROR: Error generating report with OpenAI: {str(e)}\n\n" + generate_template_report({"serverResults": []})
+
+
+def generate_vllm_report(prompt, actual_has_issues): # Changed parameter name
+    logger.info("Attempting to generate report using VLLM")
+    vllm_url = app.config.get('VLLM_CHAT_COMPLETIONS_URL')
+    vllm_model = app.config.get('VLLM_MODEL')
+    vllm_api_key = app.config.get('VLLM_API_KEY') 
+    vllm_verify_ssl = app.config.get('VLLM_VERIFY_SSL', True) 
+
+    if not vllm_url or not vllm_model:
+        logger.error("VLLM URL or model not configured.")
+        return "ERROR: VLLM URL or model not configured.\n\n" + generate_template_report({"serverResults": []})
+
+    headers = {"Content-Type": "application/json"}
+    if vllm_api_key:
+        headers["Authorization"] = f"Bearer {vllm_api_key}"
     
-    report = f"Windows Update Report\n\n"
-    report += f"Total Servers Scanned: {total_servers}\n"
-    report += f"Servers With Failed Updates: {servers_with_failures}\n"
-    report += f"Total Failed Updates: {total_failed_updates}\n\n"
+    payload = {
+        "model": vllm_model,
+        "messages": [
+            {"role": "system", "content": "You are a system administrator expert analyzing Windows updates and server health. Provide clear, concise, and actionable summaries."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3, 
+        "max_tokens": 2000 
+    }
     
-    if servers_with_failures > 0:
-        report += "Servers with Failed Updates:\n\n"
+    logger.info(f"Sending request to VLLM at {vllm_url} with model {vllm_model}. SSL Verify: {vllm_verify_ssl}")
+    logger.debug(f"VLLM request payload: {json.dumps(payload, indent=2)}")
+    try:
+        start_time = time.time()
+        response = requests.post(vllm_url, headers=headers, json=payload, timeout=180, verify=vllm_verify_ssl) 
+        request_time = time.time() - start_time
+        logger.info(f"VLLM request completed in {request_time:.2f}s. Status: {response.status_code}")
+
+        response.raise_for_status() 
+        json_response = response.json()
         
-        for server in results.get("serverResults", []):
-            if server.get("hasFailures", False):
-                report += f"Server: {server.get('serverName', 'Unknown')}\n"
-                report += f"Failed Updates: {len(server.get('failedUpdates', []))}\n\n"
+        if json_response.get("choices") and len(json_response["choices"]) > 0:
+            message = json_response["choices"][0].get("message")
+            if message and message.get("content"):
+                report_content = message["content"]
+                if not report_content.strip():
+                    logger.warning(f"VLLM model '{vllm_model}' returned an empty content string.")
+                    return "ERROR: VLLM returned an empty response content.\n\n" + generate_template_report({"serverResults": []})
                 
-                for update in server.get("failedUpdates", []):
-                    report += f"- Date: {update.get('date', 'Unknown')}\n"
-                    report += f"  Update: {update.get('update', 'Unknown')}\n"
-                    report += f"  Title: {update.get('title', 'Unknown')}\n\n"
-    else:
-        report += "No failures detected across any servers.\n"
+                logger.info(f"VLLM report generated (length: {len(report_content)}). First 100 chars: {report_content[:100]}")
+                return _validate_ai_response(report_content, vllm_model, "VLLM", actual_has_issues) # Pass actual_has_issues
+            else:
+                logger.error(f"VLLM response missing expected content structure. Message: {message}")
+                return "ERROR: VLLM response malformed (no content in message).\n\n" + generate_template_report({"serverResults": []})
+        else:
+            logger.error(f"VLLM response missing 'choices' or choices are empty. Response: {json_response}")
+            return "ERROR: VLLM response malformed (no choices or empty choices array).\n\n" + generate_template_report({"serverResults": []})
+
+    except requests.exceptions.SSLError as e_ssl:
+        logger.error(f"VLLM SSL Error: {str(e_ssl)}. Check VLLM_VERIFY_SSL setting in config.py or environment.")
+        return f"ERROR: SSL connection error with VLLM service: {str(e_ssl)}\n\n" + generate_template_report({"serverResults": []})
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"VLLM HTTP Error: {e.response.status_code} - {e.response.text[:500]}")
+        return f"ERROR: VLLM API returned an HTTP error: {e.response.status_code}. Details: {e.response.text[:200]}\n\n" + generate_template_report({"serverResults": []})
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout connecting to VLLM service at {vllm_url}.")
+        return f"ERROR: Timeout connecting to VLLM service.\n\n" + generate_template_report({"serverResults": []})
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error connecting to VLLM service: {str(e)}")
+        return f"ERROR: Cannot connect to VLLM service ({str(e)}).\n\n" + generate_template_report({"serverResults": []})
+    except json.JSONDecodeError as e:
+        logger.error(f"Error parsing VLLM JSON response: {str(e)}. Response text: {response.text[:500] if 'response' in locals() else 'N/A'}")
+        return f"ERROR: Malformed JSON response from VLLM.\n\n" + generate_template_report({"serverResults": []})
+    except Exception as e:
+        logger.error(f"General error with VLLM: {str(e)}")
+        logger.exception("Detailed traceback for VLLM error:")
+        return f"ERROR: An unexpected error occurred with VLLM service.\n\n" + generate_template_report({"serverResults": []})
+
+
+def generate_template_report(results_data): 
+    """Generates a basic, template-based report including diagnostic checks."""
+    if results_data is None: results_data = {} 
+
+    total_servers = results_data.get("totalServers", 0)
+    # servers_with_failures is now calculated based on any issue in generate_ai_report,
+    # but for template, we can be more direct or use the passed aggregate.
+    # For simplicity, let's re-evaluate based on the detailed serverResults data.
+    server_results_list = results_data.get("serverResults", [])
     
-    report += "\nRecommendation: "
-    if servers_with_failures > 0:
-        report += "Review the failed updates and schedule remediation."
-    else:
-        report += "No action required. All updates were successfully applied."
+    servers_with_any_issues = 0
+    for sr in server_results_list:
+        if sr.get("hasFailures") or "fail" in sr.get("executionStatus","").lower() or "error" in sr.get("executionStatus","").lower():
+            servers_with_any_issues +=1
+            continue # Already counted
+        diag = sr.get("diagnosticChecks", {})
+        if "low" in diag.get("DiskC", {}).get("Status", "").lower() or \
+           diag.get("PendingReboot", {}).get("IsPending") == True or \
+           "issues" in diag.get("ArcConnectivity", {}).get("Status", "").lower() or \
+           "issuesfound" in diag.get("CBSLog", {}).get("Status", "").lower():
+            servers_with_any_issues +=1
+            continue
+        for s_name, s_info in diag.get("Services", {}).items():
+            if isinstance(s_info, dict) and s_info.get("Status") != "Running" and s_info.get("Status") != "NotFound":
+                servers_with_any_issues +=1
+                break 
     
+    total_failed_updates_count = results_data.get("totalFailedUpdates", 0)
+
+    report = "Windows Update & Server Health Summary Report (Template)\n"
+    report += "=======================================================\n\n"
+    report += f"Date of Report: {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}\n\n"
+    
+    report += f"Overall Statistics:\n"
+    report += f"  Total Servers Processed: {total_servers}\n"
+    report += f"  Servers With Any Reported Issues: {servers_with_any_issues}\n"
+    report += f"  Total Windows Update Installation Failures: {total_failed_updates_count}\n\n"
+    
+    if servers_with_any_issues > 0 and server_results_list:
+        report += "Details of Servers with Issues:\n"
+        report += "-------------------------------------\n"
+        for server_info in server_results_list:
+            # Determine if this server has issues to report in the template
+            server_name = server_info.get("serverName", "Unknown Server")
+            execution_status = server_info.get("executionStatus", "Unknown")
+            error_message = server_info.get("errorMessage")
+            update_history = server_info.get("updateHistory", [])
+            failed_updates = server_info.get("failedUpdates", [])
+            diagnostics = server_info.get("diagnosticChecks", {})
+            
+            issues_on_this_server_text = []
+            if "fail" in execution_status.lower() or "error" in execution_status.lower() or error_message:
+                issues_on_this_server_text.append(f"Script Execution: {execution_status}" + (f" (Error: {error_message})" if error_message else ""))
+            if failed_updates:
+                issues_on_this_server_text.append(f"Update Failures: {len(failed_updates)} update(s)")
+            
+            # Diagnostic issues
+            disk_info = diagnostics.get("DiskC", {})
+            if "low" in disk_info.get("Status", "").lower(): issues_on_this_server_text.append(f"Disk C: {disk_info.get('Details', 'Low space')}")
+            
+            reboot_info = diagnostics.get("PendingReboot", {})
+            if reboot_info.get("IsPending"): issues_on_this_server_text.append(f"Pending Reboot: Yes ({reboot_info.get('Reasons', 'N/A')})")
+
+            arc_info = diagnostics.get("ArcConnectivity", {})
+            if "issues" in arc_info.get("Status", "").lower(): issues_on_this_server_text.append(f"Arc Connectivity: {arc_info.get('Details', 'Issues')}")
+
+            cbs_info = diagnostics.get("CBSLog", {})
+            if "issuesfound" in cbs_info.get("Status", "").lower(): issues_on_this_server_text.append(f"CBS Log: {cbs_info.get('Findings', 'Potential issues')}")
+
+            service_issues = []
+            for s_name, s_info in diagnostics.get("Services", {}).items():
+                if isinstance(s_info, dict) and s_info.get("Status") != "Running" and s_info.get("Status") != "NotFound":
+                    service_issues.append(f"{s_name} ({s_info.get('Status')})")
+            if service_issues: issues_on_this_server_text.append(f"Service Issues: {', '.join(service_issues)}")
+
+            if not issues_on_this_server_text: continue # Skip server if no template-worthy issues found
+
+            report += f"\nServer: {server_name}\n"
+            for issue_text in issues_on_this_server_text:
+                report += f"  - {issue_text}\n"
+            
+            if failed_updates:
+                report += "    Failed Update Details:\n"
+                for i, upd in enumerate(failed_updates):
+                    report += f"      - KB: {upd.get('UpdateKB', 'N/A')}, Title: {upd.get('Title', 'N/A')}, Status: {upd.get('Status', 'N/A')}\n"
+            report += "-------------------------------------\n"
+
+    elif total_servers > 0:
+        report += "Status: No significant issues detected across all processed servers.\n"
+    else:
+        report += "Status: No servers were processed, or no results available to report.\n"
+
+    report += "\nRecommendations:\n"
+    if servers_with_any_issues > 0:
+        report += "- Prioritize servers with 'CriticalLow' disk space or 'ConnectionIssues' for Azure Arc.\n"
+        report += "- Investigate specific failed updates and service issues on the identified servers.\n"
+        report += "- If pending reboots are detected, schedule them as appropriate.\n"
+        report += "- For CBS log issues, further manual log analysis might be required on the server.\n"
+    elif total_servers > 0 :
+        report += "- All processed servers appear to be healthy and updates applied successfully according to the checks.\n"
+        report += "- Continue routine monitoring.\n"
+    else:
+        report += "- No specific recommendations as no server processing data is available.\n"
+    
+    report += "\nEnd of Report.\n"
     return report
 
 # --- Email Notification ---
 
-def send_email_notification(report):
-    """Send an email notification with the update report"""
-    logger.info("Sending email notification")
-    
+def send_email_notification(report_body):
+    logger.info("Attempting to send email notification.")
     try:
         from_email = app.config['EMAIL_FROM']
         to_email = app.config['EMAIL_TO']
         smtp_server = app.config['SMTP_SERVER']
-        smtp_port = app.config['SMTP_PORT']
-        smtp_username = app.config.get('SMTP_USERNAME')
-        smtp_password = app.config.get('SMTP_PASSWORD')
+        smtp_port = int(app.config.get('SMTP_PORT', 25)) 
+        smtp_user = app.config.get('SMTP_USERNAME') 
+        smtp_pass = app.config.get('SMTP_PASSWORD') 
         
-        # Create the email
+        if not all([from_email, to_email, smtp_server]):
+            logger.error("Email configuration (FROM, TO, SERVER) is incomplete. Cannot send email.")
+            return
+
         msg = MIMEMultipart()
         msg['From'] = from_email
         msg['To'] = to_email
-        msg['Subject'] = 'Failed Updates Report - All Servers'
+        report_date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        subject_status = "Issues Detected" if "fail" in report_body.lower() or "error" in report_body.lower() or "issue" in report_body.lower() or "critical" in report_body.lower() else "All Clear"
+        msg['Subject'] = f'PatchMate Server Health & Update Report - {report_date_str} - Status: {subject_status}'
         
-        # Add report to email
-        msg.attach(MIMEText(report, 'plain'))
+        msg.attach(MIMEText(report_body, 'plain', 'utf-8')) 
         
-        # Send the email
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            # No STARTTLS or authentication needed for internal mail server
+        with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as server: 
+            server.ehlo() 
+            if smtp_user and smtp_pass: 
+                try:
+                    server.starttls() 
+                    server.ehlo() 
+                    server.login(smtp_user, smtp_pass)
+                    logger.info("SMTP connection secured with STARTTLS and logged in.")
+                except smtplib.SMTPException as e_tls:
+                    logger.warning(f"Failed to use STARTTLS or login with SMTP server {smtp_server} (User: {smtp_user}). Error: {e_tls}. Will try unencrypted if allowed by server.")
+            
             server.send_message(msg)
-        
-        logger.info("Email notification sent")
-    
+        logger.info(f"Email notification sent successfully to {to_email}.")
+
+    except smtplib.SMTPAuthenticationError as e_auth:
+        logger.error(f"SMTP Authentication Error: {str(e_auth)}. Check username/password for {smtp_server}.")
+    except smtplib.SMTPConnectError as e_conn:
+        logger.error(f"SMTP Connection Error: Failed to connect to server {smtp_server}:{smtp_port}. Error: {str(e_conn)}")
+    except smtplib.SMTPServerDisconnected as e_dis:
+        logger.error(f"SMTP Server Disconnected: Connection to {smtp_server} was lost. Error: {str(e_dis)}")
+    except smtplib.SMTPException as e_smtp: 
+        logger.error(f"SMTP Error: {str(e_smtp)} when sending email via {smtp_server}.")
+    except ConnectionRefusedError: 
+        logger.error(f"Connection Refused: Cannot connect to SMTP server {smtp_server}:{smtp_port}. Check server address and port, and if server is running.")
+    except TimeoutError: 
+        logger.error(f"Timeout sending email via {smtp_server}:{smtp_port}.")
     except Exception as e:
-        logger.error(f"Error sending email: {str(e)}")
+        logger.error(f"Unexpected error sending email: {str(e)}")
+        logger.exception("Detailed traceback for email sending failure:")
+
 
 # --- Web Interface Routes ---
-
 @app.route('/')
 def index():
-    """Render the main dashboard page"""
     return render_template(
         'index.html',
-        monitor_active=MONITOR_ACTIVE,
-        active_jobs=ACTIVE_JOBS,
-        completed_jobs=COMPLETED_JOBS,
-        server_results=SERVER_RESULTS,
-        config=app.config
+        monitor_active=APP_STATE["monitor_active"],
+        active_jobs=APP_STATE["active_jobs"],
+        completed_jobs=APP_STATE["completed_jobs"],
+        config=app.config, 
+        current_ai_provider_from_config=app.config.get('AI_PROVIDER') 
     )
 
 @app.route('/api/start-monitoring', methods=['POST'])
 def api_start_monitoring():
     result = start_file_monitoring()
-    return jsonify(result)
+    status_code = 200 if result.get("status") == "started" or result.get("status") == "already_running" else 500
+    return jsonify(result), status_code
 
 @app.route('/api/stop-monitoring', methods=['POST'])
 def api_stop_monitoring():
     result = stop_file_monitoring()
-    return jsonify(result)
+    status_code = 200 if result.get("status") == "stopped" or result.get("status") == "not_running" else 500
+    return jsonify(result), status_code
 
-@app.route('/api/process-csv', methods=['POST'])
-def api_process_csv():
+@app.route('/api/process-file', methods=['POST']) 
+def api_process_file():
     if 'file' not in request.files:
-        return jsonify({"status": "error", "message": "No file part"})
+        return jsonify({"status": "error", "message": "No file part in the request."}), 400
     
     file = request.files['file']
-    
     if file.filename == '':
-        return jsonify({"status": "error", "message": "No selected file"})
+        return jsonify({"status": "error", "message": "No file selected."}), 400
     
-    # Get file extension
-    file_ext = os.path.splitext(file.filename)[1].lower()
+    original_filename = file.filename
+    secured_filename = secure_filename(original_filename) 
+    if not secured_filename: 
+        secured_filename = f"uploaded_file_{int(time.time())}" 
     
-    # Check if file type is supported
+    file_ext = os.path.splitext(secured_filename)[1].lower()
     if file_ext not in ['.csv', '.xlsx', '.xls']:
-        return jsonify({
-            "status": "error", 
-            "message": f"Unsupported file type: {file_ext}. Please upload CSV or Excel files."
-        })
+        return jsonify({"status": "error", "message": f"Unsupported file type: '{file_ext}'. Please upload CSV or Excel files."}), 415 
     
     try:
-        upload_dir = app.config['UPLOAD_DIRECTORY']
-        # Safely ensure upload directory exists
+        upload_dir = app.config.get('UPLOAD_DIRECTORY', 'uploads')
         if not ensure_directory_exists(upload_dir):
-            return jsonify({"status": "error", "message": f"Failed to create upload directory: {upload_dir}"})
+            return jsonify({"status": "error", "message": f"Server error: Failed to create upload directory '{upload_dir}'."}), 500
             
-        file_path = os.path.join(upload_dir, file.filename)
+        file_path = os.path.join(upload_dir, secured_filename)
+        
+        counter = 1
+        base_name, ext = os.path.splitext(file_path)
+        while os.path.exists(file_path):
+            file_path = f"{base_name}_{counter}{ext}"
+            counter += 1
+            if counter > 100: 
+                 logger.error(f"Too many duplicate filenames for {secured_filename} in {upload_dir}")
+                 return jsonify({"status": "error", "message": "Server error: Could not save file due to naming conflict."}), 500
+
         file.save(file_path)
+        logger.info(f"File '{original_filename}' (saved as '{os.path.basename(file_path)}') uploaded to {file_path}. Initiating processing.")
         
-        logger.info(f"File saved to {file_path}, processing...")
-        process_machine_file(file_path)
+        threading.Thread(target=process_machine_file, args=(file_path,), daemon=True).start()
         
-        return jsonify({"status": "success", "message": f"File processed: {file.filename}"})
-    
+        return jsonify({"status": "success", "message": f"File '{original_filename}' received and processing started."}), 202 
     except Exception as e:
-        logger.error(f"Error processing uploaded file: {str(e)}")
-        logger.exception("Detailed traceback:")
-        return jsonify({"status": "error", "message": str(e)})
+        logger.error(f"Error processing uploaded file '{original_filename}': {str(e)}")
+        logger.exception("Detailed traceback for upload processing error:")
+        return jsonify({"status": "error", "message": f"Server error processing file: {str(e)}"}), 500
+
 
 @app.route('/api/status')
 def api_status():
-    """Enhanced API status endpoint that provides detailed job information"""
-    # Ensure global dictionaries are initialized
-    global ACTIVE_JOBS, COMPLETED_JOBS
+    active_jobs_list = [{"id": jid, **info} for jid, info in APP_STATE["active_jobs"].items()]
     
-    if ACTIVE_JOBS is None:
-        ACTIVE_JOBS = {}
-    if COMPLETED_JOBS is None:
-        COMPLETED_JOBS = {}
-    
-    # Format active jobs data for the UI
-    active_jobs_data = []
-    for job_id, job_info in ACTIVE_JOBS.items():
-        active_jobs_data.append({
-            "id": job_id,
-            "machine": job_info.get("machine", "Unknown"),
-            "start_time": job_info.get("start_time", ""),
-            "status": job_info.get("status", "running")
-        })
-    
-    # Format completed jobs data for the UI
-    completed_jobs_data = []
-    for job_id, job_info in COMPLETED_JOBS.items():
-        job_data = {
-            "id": job_id,
-            "machine": job_info.get("machine", "Unknown"),
-            "completion_time": job_info.get("completion_time", ""),
-            "status": job_info.get("status", "unknown"),
-            "error": job_info.get("error", "") if job_info.get("status") in ["error", "failed"] else ""
-        }
-        
-        # Add update counts if available
-        if job_info.get("status") == "completed" and "results" in job_info:
-            results = job_info.get("results", {})
-            job_data["updates"] = results.get("totalUpdates", 0)
-            job_data["failed"] = len(results.get("failedUpdates", []))
-            job_data["results"] = results
-        else:
-            job_data["updates"] = 0
-            job_data["failed"] = 0
-            
-        completed_jobs_data.append(job_data)
-    
-    # Log what we're returning for debugging
-    logger.debug(f"Status API returning: {len(active_jobs_data)} active jobs, {len(completed_jobs_data)} completed jobs")
-    
-    return jsonify({
-        "monitor_active": MONITOR_ACTIVE,
-        "active_jobs": len(active_jobs_data),
-        "active_jobs_data": active_jobs_data,
-        "completed_jobs": len(completed_jobs_data),
-        "completed_jobs_data": completed_jobs_data,
-        "server_results": len(SERVER_RESULTS) if SERVER_RESULTS else 0
-    })
-
-# Add a reset endpoint to clear data if needed
-@app.route('/api/reset', methods=['POST'])
-def api_reset():
-    """Reset application state"""
-    initialize_app_state()
-    return jsonify({"status": "success", "message": "Application state reset"})
-
-# Add these routes to app.py
-
-@app.route('/api/ollama-models')
-def api_ollama_models():
-    """Get available models from Ollama server"""
+    completed_jobs_list = []
     try:
-        # Get base URL from config (without the /api/generate endpoint)
-        ollama_url = app.config.get('OLLAMA_URL', 'http://host.docker.internal:11434/api/generate')
-        base_url = ollama_url.rsplit('/api/', 1)[0]
+        # Sort completed jobs by completion_time descending if available, otherwise by job ID as fallback
+        sorted_completed_jobs = sorted(
+            APP_STATE["completed_jobs"].items(), 
+            key=lambda item: (item[1].get("completion_time", "0") if item[1].get("completion_time") else "0", item[0]),
+            reverse=True
+        )
+    except Exception as e: 
+        logger.warning(f"Could not sort completed jobs, using unsorted: {e}")
+        sorted_completed_jobs = APP_STATE["completed_jobs"].items()
 
-        # Query Ollama API for available models
-        models_url = f"{base_url}/api/tags"
-        logger.info(f"Querying Ollama models at: {models_url}")
+    for job_id, job_info in sorted_completed_jobs:
+        job_data = {"id": job_id, **job_info} # Start with all info from job_info
         
-        response = requests.get(models_url, timeout=10)
-        
-        if response.status_code == 200:
-            models_data = response.json()
-            logger.info(f"Found {len(models_data.get('models', []))} models in Ollama")
-            
-            # Format the results
-            models = []
-            for model in models_data.get('models', []):
-                models.append({
-                    'name': model.get('name'),
-                    'modified_at': model.get('modified_at'),
-                    'size': model.get('size')
-                })
-                
-            return jsonify({
-                "status": "success",
-                "current_model": app.config.get('OLLAMA_MODEL', 'mistral'),
-                "models": models
-            })
-        else:
-            logger.error(f"Error querying Ollama models: {response.status_code} - {response.text}")
-            return jsonify({
-                "status": "error", 
-                "message": f"Failed to get models: {response.status_code}",
-                "current_model": app.config.get('OLLAMA_MODEL', 'mistral')
-            })
-            
-    except Exception as e:
-        logger.error(f"Error getting Ollama models: {str(e)}")
-        return jsonify({
-            "status": "error",
-            "message": str(e),
-            "current_model": app.config.get('OLLAMA_MODEL', 'mistral')
-        })
+        # Extract and simplify results for the status API to keep it lean
+        # The full results are still in APP_STATE["completed_jobs"][job_id]["results"]
+        if "results" in job_info and isinstance(job_info["results"], dict):
+            results_summary = job_info["results"]
+            job_data["total_updates_in_job"] = results_summary.get("totalUpdates", 0)
+            job_data["failed_updates_in_job"] = len(results_summary.get("failedUpdates", []))
+            job_data["execution_status_from_script"] = results_summary.get("executionStatus", "Unknown")
+            job_data["script_error_message"] = results_summary.get("errorMessage")
+            # Include a snippet of raw output if available from parsing
+            job_data["raw_output_excerpt"] = results_summary.get("rawOutputExcerpt", "N/A")
 
-@app.route('/api/set-ollama-model', methods=['POST'])
-def api_set_ollama_model():
-    """Set the Ollama model to use for report generation"""
+
+        # Ensure 'status' in job_data reflects the script's executionStatus if available
+        # or the overall job status set by process_machine
+        job_data["status"] = job_info.get("status", "unknown") # This is the overarching job status
+        if "results" in job_info and isinstance(job_info["results"], dict) and job_info["results"].get("executionStatus"):
+             job_data["status"] = job_info["results"]["executionStatus"].lower() # Override with script status if more specific
+
+        completed_jobs_list.append(job_data)
+
+    return jsonify({
+        "monitor_active": APP_STATE["monitor_active"],
+        "active_jobs_count": len(active_jobs_list),
+        "active_jobs": active_jobs_list, 
+        "completed_jobs_count": len(completed_jobs_list),
+        "completed_jobs": completed_jobs_list, 
+        "current_server_results_batch_size": len(APP_STATE["server_results"]),
+        "current_ai_provider": app.config.get('AI_PROVIDER') 
+    }), 200
+
+
+@app.route('/api/reset-state', methods=['POST']) 
+def api_reset_state():
+    logger.info("API call to reset application state received.")
+    if APP_STATE["monitor_active"] and APP_STATE["observer"]:
+        logger.info("Stopping active file monitoring before full state reset.")
+        stop_file_monitoring() 
+
+    initialize_app_state() 
+    logger.info("Application state has been fully reset via API.")
+    return jsonify({"status": "success", "message": "Application state has been reset."}), 200
+
+@app.route('/api/set-ai-provider', methods=['POST'])
+def api_set_ai_provider():
     try:
         data = request.json
-        model_name = data.get('model')
+        new_provider = data.get('provider')
         
-        if not model_name:
-            return jsonify({"status": "error", "message": "No model name provided"})
+        if not new_provider or new_provider.lower() not in ['ollama', 'vllm', 'openai', 'template']:
+            return jsonify({"status": "error", "message": "Invalid or missing AI provider specified."}), 400
         
-        # Update the config
-        app.config['OLLAMA_MODEL'] = model_name
-        logger.info(f"Changed Ollama model to: {model_name}")
+        app.config['AI_PROVIDER'] = new_provider.lower()
+        logger.info(f"AI Provider changed to: {app.config['AI_PROVIDER']} (in-memory config).")
         
         return jsonify({
             "status": "success",
-            "message": f"Model changed to {model_name}",
-            "current_model": model_name
-        })
-        
+            "message": f"AI Provider set to {app.config['AI_PROVIDER']}.",
+            "current_ai_provider": app.config['AI_PROVIDER']
+        }), 200
     except Exception as e:
-        logger.error(f"Error setting Ollama model: {str(e)}")
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        })
-    
-@app.route('/api/clear-completed', methods=['POST'])
-def api_clear_completed():
-    COMPLETED_JOBS.clear()
-    return jsonify({"status": "success"})
+        logger.error(f"Error setting AI provider: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route('/api/debug', methods=['GET'])
-def api_debug():
-    """Debug endpoint to see internal state and test AI reporting"""
+
+@app.route('/api/ai-provider-models') 
+def api_ai_provider_models():
+    ai_provider = app.config.get('AI_PROVIDER', 'template').lower() 
+    current_model_key = None
+    fetch_url = None
+    provider_name_for_log = "Unknown"
+    current_model_value = "N/A"
+    vllm_verify_ssl = app.config.get('VLLM_VERIFY_SSL', True) # Get SSL verification for VLLM
+
+    if ai_provider == 'ollama':
+        ollama_url_config = app.config.get('OLLAMA_URL', 'http://host.docker.internal:11434/api/generate')
+        base_url_parts = ollama_url_config.split('/api/')
+        if len(base_url_parts) < 1: 
+            logger.error(f"OLLAMA_URL format is unexpected: {ollama_url_config}")
+            return jsonify({"status": "error", "provider": ai_provider, "message": "Ollama base URL misconfigured."}), 500
+        base_url = base_url_parts[0]
+        fetch_url = f"{base_url}/api/tags" 
+        current_model_key = 'OLLAMA_MODEL'
+        provider_name_for_log = "Ollama"
+        current_model_value = app.config.get(current_model_key, 'mistral')
+    elif ai_provider == 'vllm':
+        fetch_url = app.config.get('VLLM_MODELS_URL')
+        current_model_key = 'VLLM_MODEL'
+        provider_name_for_log = "VLLM"
+        current_model_value = app.config.get(current_model_key, 'your-default-vllm-model')
+    elif ai_provider == 'openai':
+        logger.info("OpenAI model listing requested. Returning configured model and common alternatives.")
+        common_openai_models = [
+            {"name": "gpt-4", "description": "Latest generation, most capable."},
+            {"name": "gpt-4-turbo", "description": "Updated GPT-4 with wider context."},
+            {"name": "gpt-3.5-turbo", "description": "Fast and cost-effective for many tasks."}
+        ]
+        current_openai_model = app.config.get('OPENAI_MODEL', 'gpt-3.5-turbo')
+        if not any(m['name'] == current_openai_model for m in common_openai_models):
+            common_openai_models.append({"name": current_openai_model, "description": "Currently configured model."})
+        
+        return jsonify({
+            "status": "success", 
+            "provider": "openai",
+            "current_model": current_openai_model,
+            "models": common_openai_models 
+        }), 200
+    else: 
+        return jsonify({
+            "status": "success", 
+            "provider": ai_provider,
+            "current_model": "N/A (template or unknown provider)",
+            "models": []
+        }), 200
+
+    if not fetch_url:
+        logger.warning(f"No model fetch URL defined for AI provider: {ai_provider}")
+        return jsonify({"status": "error", "provider": ai_provider, "message": f"Model listing not supported or configured for {ai_provider}."}), 404
+
+    logger.info(f"Querying {provider_name_for_log} models at: {fetch_url}. SSL Verify: {vllm_verify_ssl if ai_provider == 'vllm' else 'N/A'}")
     try:
-        # Gather debug info
+        headers = {}
+        request_kwargs = {'headers': headers, 'timeout': 15}
+        if ai_provider == 'vllm':
+            if app.config.get('VLLM_API_KEY'):
+                headers["Authorization"] = f"Bearer {app.config['VLLM_API_KEY']}"
+            request_kwargs['verify'] = vllm_verify_ssl # Apply SSL verification for VLLM
+
+        response = requests.get(fetch_url, **request_kwargs)
+        response.raise_for_status()
+        
+        data = response.json()
+        models_list = []
+
+        if ai_provider == 'ollama' and 'models' in data:
+            models_list = [{'name': m.get('name'), 'modified_at': m.get('modified_at'), 'size': m.get('size')}
+                           for m in data.get('models', [])]
+        elif ai_provider == 'vllm' and 'data' in data and isinstance(data['data'], list): 
+            models_list = [{'name': m.get('id'), 'owned_by': m.get('owned_by', 'unknown'), 'object_type': m.get('object')}
+                           for m in data['data']]
+        else:
+            logger.warning(f"Unexpected response format from {provider_name_for_log} model endpoint: {data}")
+            models_list = [] 
+
+        logger.info(f"Found {len(models_list)} models for {provider_name_for_log}.")
+        return jsonify({
+            "status": "success",
+            "provider": ai_provider,
+            "current_model": current_model_value,
+            "models": models_list
+        }), 200
+    except requests.exceptions.SSLError as e_ssl:
+        logger.error(f"{provider_name_for_log} SSL Error: {str(e_ssl)}. Check VLLM_VERIFY_SSL setting.")
+        return jsonify({"status": "error", "provider": ai_provider, "message": f"SSL connection error with {provider_name_for_log}: {str(e_ssl)}"}), 503
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error querying {provider_name_for_log} models: {e.response.status_code} - {e.response.text[:200]}")
+        return jsonify({"status": "error", "provider": ai_provider, "message": f"Failed to get models from {provider_name_for_log}: HTTP {e.response.status_code}"}), e.response.status_code
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error connecting to {provider_name_for_log} for models: {str(e)}")
+        return jsonify({"status": "error", "provider": ai_provider, "message": f"Cannot connect to {provider_name_for_log}: {str(e)}"}), 503 
+    except Exception as e:
+        logger.error(f"Unexpected error getting {provider_name_for_log} models: {str(e)}")
+        return jsonify({"status": "error", "provider": ai_provider, "message": str(e)}), 500
+
+
+@app.route('/api/set-ai-model', methods=['POST']) 
+def api_set_ai_model():
+    try:
+        data = request.json
+        model_name = data.get('model')
+        provider = app.config.get('AI_PROVIDER', 'template').lower()
+
+        if not model_name:
+            return jsonify({"status": "error", "message": "No model name provided."}), 400
+        
+        config_key_to_set = None
+        if provider == 'ollama':
+            config_key_to_set = 'OLLAMA_MODEL'
+        elif provider == 'vllm':
+            config_key_to_set = 'VLLM_MODEL'
+        elif provider == 'openai':
+            config_key_to_set = 'OPENAI_MODEL'
+        else:
+            logger.warning(f"Attempt to set model for an unsupported or template provider: {provider}")
+            return jsonify({"status": "error", "message": f"Cannot set model for provider '{provider}'."}), 400
+
+        app.config[config_key_to_set] = model_name
+        logger.info(f"AI model for provider '{provider}' changed to: {model_name} (in-memory config).")
+        
+        return jsonify({"status": "success", "message": f"Model for {provider} changed to {model_name}.", "current_model": model_name, "provider": provider}), 200
+    except Exception as e:
+        logger.error(f"Error setting AI model: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+    
+
+@app.route('/api/clear-transient-data', methods=['POST']) 
+def api_clear_transient_data():
+    APP_STATE["completed_jobs"].clear() # This is the primary target for this button now
+    APP_STATE["server_results"].clear() 
+    APP_STATE["processed_files_on_startup"].clear() 
+    logger.info("Transient data (completed jobs, server results, processed file list for session) cleared via API.")
+    return jsonify({"status": "success", "message": "Completed jobs list, current server results batch, and session's processed file list have been cleared."}), 200
+
+
+@app.route('/api/debug-info', methods=['GET']) 
+def api_debug_info():
+    try:
         debug_info = {
-            "app_version": "1.1.0",
-            "monitor_active": MONITOR_ACTIVE,
-            "active_jobs_count": len(ACTIVE_JOBS),
-            "completed_jobs_count": len(COMPLETED_JOBS),
-            "server_results_count": len(SERVER_RESULTS),
-            "active_jobs": ACTIVE_JOBS,
-            "completed_jobs": COMPLETED_JOBS,
-            "server_results": SERVER_RESULTS
+            "app_version": "1.2.2 (Job Display Fix)", 
+            "flask_debug_mode": app.debug,
+            "current_time_utc": datetime.utcnow().isoformat(),
+            "monitor_active": APP_STATE["monitor_active"],
+            "active_jobs_count": len(APP_STATE["active_jobs"]),
+            "completed_jobs_count": len(APP_STATE["completed_jobs"]),
+            "server_results_batch_size": len(APP_STATE["server_results"]), 
+            "processed_files_in_session_count": len(APP_STATE["processed_files_on_startup"]),
+            "python_version": sys.version,
+            "platform": sys.platform,
+            "cwd": os.getcwd(),
+            "current_runtime_ai_provider": app.config.get('AI_PROVIDER'), 
+            "initial_config_ai_provider": app.config.get('AI_PROVIDER', os.getenv('AI_PROVIDER', 'ollama')), 
+            "config_ollama_model": app.config.get('OLLAMA_MODEL'),
+            "config_vllm_model": app.config.get('VLLM_MODEL'),
+            "config_openai_model": app.config.get('OPENAI_MODEL'),
+            "config_watch_dir": app.config.get('WATCH_DIRECTORY'),
+            "config_upload_dir": app.config.get('UPLOAD_DIRECTORY'),
+            "config_vllm_verify_ssl": app.config.get('VLLM_VERIFY_SSL') 
         }
         
-        # Check if user wants to test AI report generation
-        test_ai = request.args.get('test_ai', 'false').lower() == 'true'
-        
-        if test_ai and SERVER_RESULTS:
-            # Generate a test report
-            aggregate_results = {
-                "serverResults": SERVER_RESULTS,
-                "totalServers": len(SERVER_RESULTS),
-                "serversWithFailures": len([s for s in SERVER_RESULTS if s.get("hasFailures", False)]),
-                "totalFailedUpdates": sum(len(s.get("failedUpdates", [])) for s in SERVER_RESULTS)
-            }
-            
-            report = generate_ai_report(aggregate_results)
-            debug_info["test_ai_report"] = report
-            
-        return jsonify(debug_info)
+        test_ai_param = request.args.get('test_ai_report', 'false').lower()
+        if test_ai_param == 'true' and APP_STATE["completed_jobs"]: # Test with completed jobs if server_results is empty
+            logger.info("Debug: Generating test AI report based on a sample of completed_jobs data.")
+            # Create a sample aggregate from completed_jobs if server_results is empty
+            # This is a simplified sample for testing the prompt with new structure
+            sample_server_results_for_test = [job.get("results") for job in list(APP_STATE["completed_jobs"].values()) if job.get("results")]
+            if sample_server_results_for_test:
+                test_aggregate_results = {
+                    "serverResults": sample_server_results_for_test[:3], # Test with up to 3
+                    "totalServers": len(sample_server_results_for_test[:3]),
+                    "serversWithFailures": len([s for s in sample_server_results_for_test[:3] if s.get("hasFailures", False) or "fail" in s.get("executionStatus","").lower() or "error" in s.get("executionStatus","").lower()]),
+                    "totalFailedUpdates": sum(len(s.get("failedUpdates", [])) for s in sample_server_results_for_test[:3])
+                }
+                report_test_content = generate_ai_report(test_aggregate_results)
+                debug_info["test_ai_report_preview"] = report_test_content[:1000] + "..." if len(report_test_content) > 1000 else report_test_content
+                debug_info["test_ai_report_provider_used"] = app.config.get('AI_PROVIDER')
+            else:
+                debug_info["test_ai_report_message"] = "No completed jobs with parsable results found to generate a test report."
+        elif test_ai_param == 'true':
+             debug_info["test_ai_report_message"] = "No server results or completed jobs with results available to generate a test report."
+
+        return jsonify(debug_info), 200
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
-    
-@app.route('/api/reload-template')
-def reload_template():
-    """Force reload template and restart application"""
+        logger.error(f"Error in /api/debug-info: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/reload-templates', methods=['POST']) 
+def reload_template_cache():
     try:
-        # Clear template cache
-        app.jinja_env.cache = {}
-        return jsonify({"status": "success", "message": "Template cache cleared, refresh the page"})
+        app.jinja_env.cache = {} 
+        logger.info("Jinja2 template cache cleared via API. A page refresh may be needed.")
+        return jsonify({"status": "success", "message": "Template cache cleared. Refresh your browser to see changes."}), 200
     except Exception as e:
         logger.error(f"Error clearing template cache: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)})
+        return jsonify({"status": "error", "message": str(e)}), 500
     
 @app.route('/api/system-info')
 def api_system_info():
     try:
-        info = {
-            "app_version": "1.1.0",  # Update this with your version
-            "python_version": sys.version,
-            "os_info": os.name,
-            "watch_directory": app.config['WATCH_DIRECTORY'],
-            "watch_directory_exists": os.path.exists(app.config['WATCH_DIRECTORY']),
-            "upload_directory": app.config['UPLOAD_DIRECTORY'],
-            "upload_directory_exists": os.path.exists(app.config['UPLOAD_DIRECTORY']),
-            "monitor_active": MONITOR_ACTIVE,
-            "active_jobs": len(ACTIVE_JOBS),
-            "completed_jobs": len(COMPLETED_JOBS),
-            "results_count": len(SERVER_RESULTS),
-            "installed_packages": {
-                "pandas": pd.__version__,
-                "flask": Flask.__version__,
-                "watchdog": "Installed"  # You could import watchdog to get the version
-            }
-        }
-        
-        # Check for Excel support
+        watch_dir_config = app.config.get('WATCH_DIRECTORY', 'Not Set')
+        upload_dir_config = app.config.get('UPLOAD_DIRECTORY', 'uploads') 
+
+        excel_support_status = "Not installed"
         try:
             import openpyxl
-            info["excel_support"] = f"Installed (openpyxl {openpyxl.__version__})"
+            excel_support_status = f"Installed (openpyxl {openpyxl.__version__})"
+            import xlrd 
+            excel_support_status += f", (xlrd {xlrd.__version__ if hasattr(xlrd, '__version__') else 'version unknown'})"
         except ImportError:
-            info["excel_support"] = "Not installed"
-        
-        return jsonify(info)
+            try:
+                import openpyxl
+                excel_support_status = f"Partial: openpyxl {openpyxl.__version__} (xlrd missing for .xls)"
+            except ImportError:
+                 try:
+                    import xlrd
+                    excel_support_status = f"Partial: xlrd {xlrd.__version__ if hasattr(xlrd, '__version__') else 'version unknown'} (openpyxl missing for .xlsx)"
+                 except ImportError:
+                    excel_support_status = "Neither openpyxl nor xlrd found."
+
+        info = {
+            "application_version": "1.2.2 (Job Display Fix)", 
+            "python_version": sys.version,
+            "platform_details": f"{os.name} - {sys.platform}",
+            "watch_directory_configured": watch_dir_config,
+            "watch_directory_exists": os.path.exists(watch_dir_config) if watch_dir_config != 'Not Set' else False,
+            "upload_directory_configured": upload_dir_config,
+            "upload_directory_exists": os.path.exists(upload_dir_config), 
+            "monitor_is_active": APP_STATE["monitor_active"],
+            "current_runtime_ai_provider": app.config.get('AI_PROVIDER'), 
+            "ollama_model_setting": app.config.get('OLLAMA_MODEL'),
+            "vllm_model_setting": app.config.get('VLLM_MODEL'),
+            "openai_model_setting": app.config.get('OPENAI_MODEL'),
+            "vllm_ssl_verify_setting": app.config.get('VLLM_VERIFY_SSL'), 
+            "installed_packages_check": {
+                "pandas": pd.__version__ if 'pd' in globals() and hasattr(pd, '__version__') else "Not imported/found or version unknown",
+                "flask": Flask.__version__ if 'Flask' in globals() and hasattr(Flask, '__version__') else "Not imported/found or version unknown",
+                "watchdog": getattr(__import__('watchdog'), '__version__', 'Installed, version not detected'),
+                "requests": requests.__version__ if 'requests' in globals() and hasattr(requests, '__version__') else "Not imported/found or version unknown",
+                "werkzeug": getattr(__import__('werkzeug'), '__version__', 'Installed, version not detected')
+            },
+            "excel_support_libraries": excel_support_status
+        }
+        return jsonify(info), 200
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
+        logger.error(f"Error in /api/system-info: {str(e)}")
+        logger.exception("Detailed traceback for system-info error:")
+        return jsonify({"status": "error", "message": f"Internal server error: {str(e)}"}), 500
 
 # --- Main Entry Point ---
-
 if __name__ == '__main__':
-    # Initialize the app state to ensure clean startup
-    initialize_app_state()
-    
-    # Try to ensure Excel support is available
     try:
-        update_requirements()
+        update_requirements() 
     except Exception as e:
-        logger.warning(f"Unable to automatically install Excel support: {str(e)}")
+        logger.warning(f"Could not run update_requirements() on startup: {str(e)}")
     
-    # Start file monitoring if configured to do so
+    logger.info(f"Application starting with AI_PROVIDER set to: {app.config.get('AI_PROVIDER')}")
+    logger.info(f"VLLM SSL Verification is set to: {app.config.get('VLLM_VERIFY_SSL')}")
+
+
     if app.config.get('AUTO_START_MONITORING', False):
-        start_file_monitoring()
+        logger.info("AUTO_START_MONITORING is enabled. Starting file monitoring...")
+        startup_monitor_thread = threading.Thread(target=start_file_monitoring, daemon=True)
+        startup_monitor_thread.start()
+    else:
+        logger.info("AUTO_START_MONITORING is disabled. File monitoring can be started via API.")
     
-    # Start the Flask application
+    try:
+        port_num = int(app.config.get('PORT', 5000))
+    except ValueError:
+        logger.warning(f"Invalid PORT value '{app.config.get('PORT')}' in config. Defaulting to 5000.")
+        port_num = 5000
+
     app.run(
         host=app.config.get('HOST', '0.0.0.0'),
-        port=app.config.get('PORT', 5000),
-        debug=app.config.get('DEBUG', False)
+        port=port_num,
+        debug=app.config.get('DEBUG', False),
     )
