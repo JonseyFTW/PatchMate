@@ -78,9 +78,6 @@ class EnhancedFileHandler(FileSystemEventHandler):
     
     def __init__(self):
         super().__init__()
-        # Initialize _processed_files here if you want it per instance,
-        # or use a global/persistent store for tracking across restarts/instances.
-        # For this context, using a set tracked within APP_STATE for the current run.
         self._processed_this_session = APP_STATE["processed_files_on_startup"]
 
     def process_file(self, file_path):
@@ -99,7 +96,7 @@ class EnhancedFileHandler(FileSystemEventHandler):
                 logger.info(f"Processing supported file: {file_path}")
                 try:
                     process_machine_file(file_path)
-                    self._processed_this_session.add(file_path) # Add after successful attempt to process
+                    self._processed_this_session.add(file_path) 
                 except Exception as e:
                     logger.error(f"Error processing file {file_path}: {str(e)}")
             else:
@@ -112,25 +109,18 @@ class EnhancedFileHandler(FileSystemEventHandler):
     def on_modified(self, event):
         logger.debug(f"Modification event detected: {event.src_path}")
         if not event.is_directory and os.path.exists(event.src_path):
-            self.process_file(event.src_path) # process_file now handles the check for already processed
+            self.process_file(event.src_path) 
     
     def on_moved(self, event):
         logger.debug(f"Move event detected: {event.dest_path}")
         self.process_file(event.dest_path)
 
 def normalize_path_conservative(path_str):
-    """Normalizes a path by replacing backslashes and stripping whitespace.
-    Does NOT attempt to remove drive letters or other complex transformations
-    that might break valid absolute paths.
-    """
     if not isinstance(path_str, str):
         logger.warning(f"normalize_path_conservative received non-string input: {type(path_str)}. Returning as is.")
         return path_str
-    # Replace backslashes with forward slashes for consistency
     normalized = path_str.replace('\\', '/')
-    # Strip leading/trailing whitespace
     normalized = normalized.strip()
-    # Remove trailing slash if it's not the root directory
     if len(normalized) > 1 and normalized.endswith('/'):
         normalized = normalized[:-1]
     logger.debug(f"Normalized path from '{path_str}' to '{normalized}' (conservative)")
@@ -138,12 +128,7 @@ def normalize_path_conservative(path_str):
 
 
 def ensure_directory_exists(path):
-    """Safely create a directory if it doesn't exist. Uses conservative normalization."""
-    # Use the original path for os.path.exists and os.makedirs
-    # Normalization here should be minimal and safe.
-    # path_to_check = normalize_path_conservative(path) # Conservative normalization
-    path_to_check = path # Using original path directly for os functions
-
+    path_to_check = path 
     if not os.path.exists(path_to_check):
         logger.info(f"Creating directory: {path_to_check}")
         try:
@@ -171,14 +156,14 @@ def process_machine_file(file_path):
                 df = pd.read_csv(file_path, encoding='latin1')
             except Exception as e:
                 logger.error(f"Error reading CSV {file_path}: {str(e)}")
-                raise # Re-raise after logging
+                raise 
         elif file_ext in ['.xlsx', '.xls']:
             logger.info(f"Reading Excel file: {file_path}")
             try:
                 df = pd.read_excel(file_path)
             except Exception as e:
                 logger.error(f"Error reading Excel file {file_path}: {str(e)}")
-                raise # Re-raise
+                raise 
         else:
             logger.error(f"Unsupported file extension: {file_ext}")
             return
@@ -191,15 +176,15 @@ def process_machine_file(file_path):
             return
         
         logger.info(f"Using column '{machine_col}' for machine names")
-        machines = df[machine_col].dropna().astype(str).tolist() # Ensure strings
+        machines = df[machine_col].dropna().astype(str).tolist() 
         logger.info(f"Found {len(machines)} machines in file")
         
         if machines:
             logger.info(f"Sample machine names: {machines[:min(5, len(machines))]}")
         
         for machine_raw in machines:
-            machine = str(machine_raw).strip() # Ensure machine name is a string and stripped
-            if machine: # Check if machine name is not empty after stripping
+            machine = str(machine_raw).strip() 
+            if machine: 
                 threading.Thread(
                     target=process_machine,
                     args=(machine,),
@@ -212,7 +197,6 @@ def process_machine_file(file_path):
     except Exception as e:
         logger.error(f"Critical error in process_machine_file for {file_path}: {str(e)}")
         logger.exception("Detailed traceback for process_machine_file:")
-        # Don't re-raise here as this function is often called from a thread or event handler
 
 def start_file_monitoring():
     if APP_STATE["monitor_active"]:
@@ -222,10 +206,9 @@ def start_file_monitoring():
     logger.info(f"Attempting to start file monitoring on: {watch_dir}")
     
     try:
-        # Use the original path from config for os.path.exists
         if not os.path.exists(watch_dir):
             logger.info(f"Watch directory {watch_dir} does not exist. Attempting to create.")
-            if not ensure_directory_exists(watch_dir): # ensure_directory_exists handles its own logging
+            if not ensure_directory_exists(watch_dir): 
                  logger.error(f"Failed to create watch directory {watch_dir}. Monitoring cannot start.")
                  return {"status": "error", "message": f"Failed to create watch directory: {watch_dir}"}
 
@@ -236,16 +219,12 @@ def start_file_monitoring():
             logger.warning(f"Could not list directory contents for {watch_dir}: {str(e)}")
         
         event_handler = EnhancedFileHandler()
-        # Using PollingObserver as a fallback for network drives or systems where InotifyObserver might fail
-        APP_STATE["observer"] = PollingObserver(timeout=5) # Increased timeout slightly
+        APP_STATE["observer"] = PollingObserver(timeout=5) 
         APP_STATE["observer"].schedule(event_handler, watch_dir, recursive=False)
         APP_STATE["observer"].start()
         APP_STATE["monitor_active"] = True
         
         logger.info(f"File monitoring started on {watch_dir} (using polling observer)")
-        # The periodic_directory_check might be redundant with PollingObserver,
-        # but can act as a safety net or be removed if PollingObserver is reliable.
-        # For now, keeping it as it was part of the original logic.
         threading.Thread(target=periodic_directory_check, args=(watch_dir,), daemon=True).start()
         return {"status": "started"}
     except Exception as e:
@@ -254,13 +233,7 @@ def start_file_monitoring():
         return {"status": "error", "message": str(e)}
 
 def periodic_directory_check(directory_path):
-    """Periodically checks for new files, complementing Watchdog."""
     last_check_files = set()
-    # Populate initial set of files to avoid processing existing files on first run
-    # if the monitor starts after files are already there.
-    # Note: EnhancedFileHandler also has its own `_processed_this_session` logic.
-    # This initial population helps avoid redundant processing if files were added
-    # *just* before the check loop started but *after* monitor initialization.
     try:
         if os.path.exists(directory_path):
             for filename in os.listdir(directory_path):
@@ -271,13 +244,12 @@ def periodic_directory_check(directory_path):
     except Exception as e:
         logger.error(f"Error during initial population in periodic_directory_check for {directory_path}: {str(e)}")
 
-
     while APP_STATE["monitor_active"]:
         try:
             current_files = set()
             if not os.path.exists(directory_path):
                 logger.warning(f"Periodic check: Directory {directory_path} not found. Skipping check.")
-                time.sleep(30) # Wait before next check
+                time.sleep(30) 
                 continue
 
             for filename in os.listdir(directory_path):
@@ -289,7 +261,6 @@ def periodic_directory_check(directory_path):
             if new_files:
                 logger.info(f"Periodic check found {len(new_files)} new files: {new_files}")
                 for file_path in new_files:
-                    # Check against EnhancedFileHandler's processed set as well to be sure
                     if file_path in APP_STATE["processed_files_on_startup"]:
                         logger.info(f"Periodic check: File {file_path} already handled by Watchdog. Skipping.")
                         continue
@@ -298,13 +269,13 @@ def periodic_directory_check(directory_path):
                         if file_ext in ['.csv', '.xlsx', '.xls']:
                             logger.info(f"Periodic check processing found file: {file_path}")
                             process_machine_file(file_path)
-                            APP_STATE["processed_files_on_startup"].add(file_path) # Mark as processed
+                            APP_STATE["processed_files_on_startup"].add(file_path) 
                     except Exception as e:
                         logger.error(f"Error processing found file {file_path} in periodic check: {str(e)}")
             last_check_files = current_files
         except Exception as e:
             logger.error(f"Error in periodic directory check loop: {str(e)}")
-        time.sleep(30) # Check interval
+        time.sleep(30) 
     logger.info("Periodic directory check thread stopped.")
     
 def stop_file_monitoring():
@@ -312,9 +283,9 @@ def stop_file_monitoring():
         return {"status": "not_running"}
     try:
         APP_STATE["observer"].stop()
-        APP_STATE["observer"].join() # Wait for the observer thread to finish
+        APP_STATE["observer"].join() 
         APP_STATE["monitor_active"] = False
-        APP_STATE["observer"] = None # Clear the observer object
+        APP_STATE["observer"] = None 
         logger.info("File monitoring stopped")
         return {"status": "stopped"}
     except Exception as e:
@@ -324,72 +295,60 @@ def stop_file_monitoring():
 # --- File Processing ---
 
 def find_machine_name_column(df):
-    """Improved logic to find the machine name column."""
-    # Prefer columns explicitly named "Machine Name", "Computer Name", etc.
     preferred_patterns = [
         r'^machine\s*name$', r'^computer\s*name$', r'^host\s*name$', r'^server\s*name$'
     ]
     for col in df.columns:
-        col_str = str(col) # Ensure column name is a string
+        col_str = str(col) 
         for pattern in preferred_patterns:
             if re.search(pattern, col_str.lower().strip()):
                 return col
-
-    # Broader patterns
     patterns = [
         r'machine', r'computer', r'host', r'server', r'name'
     ]
     for col in df.columns:
         col_str = str(col)
-        if 'machine' in col_str.lower() and 'name' in col_str.lower(): # Common combination
+        if 'machine' in col_str.lower() and 'name' in col_str.lower(): 
             return col
     for pattern in patterns:
         for col in df.columns:
             col_str = str(col)
             if re.search(pattern, col_str.lower().strip()):
                 return col
-    
-    # If few columns, check for typical machine name format (alphanumeric, dots, hyphens)
     if len(df.columns) <= 3:
         for col in df.columns:
             if df[col].dtype == 'object' and not df[col].empty:
-                # Get a sample of non-null values to check format
                 samples = df[col].dropna()
                 if not samples.empty:
-                    # Check if a good portion of samples match machine name regex
                     match_count = 0
-                    for sample_val in samples.head(5): # Check first 5 non-null samples
+                    for sample_val in samples.head(5): 
                         if isinstance(sample_val, str) and re.match(r'^[a-zA-Z0-9.\-]+$', sample_val.strip()):
                             match_count += 1
-                    if match_count > 0 : # If at least one matches, consider it a candidate
+                    if match_count > 0 : 
                         logger.info(f"Column '{col}' selected by content format heuristic.")
                         return col
-                        
-    # Fallback: if only one column, use it
     if len(df.columns) == 1:
         return df.columns[0]
-        
     logger.warning("Could not definitively identify machine name column.")
     return None
 
 
 def process_machine(machine_name):
     logger.info(f"Processing machine: {machine_name}")
-    job_id = None # Initialize job_id
+    job_id = None 
     
     try:
         job_id = run_azure_runbook(machine_name)
         
         if not job_id:
             logger.error(f"Failed to start runbook for {machine_name}. No Job ID received.")
-            # Create a unique ID for this error entry
             error_id = f"error_{machine_name.replace('.', '_')}_{int(time.time())}"
             APP_STATE["completed_jobs"][error_id] = {
                 "machine": machine_name, "status": "error",
                 "error": "Failed to start runbook (no Job ID)",
                 "completion_time": datetime.now().isoformat()
             }
-            check_all_complete() # Check if this was the last one
+            check_all_complete() 
             return
         
         APP_STATE["active_jobs"][job_id] = {
@@ -397,41 +356,36 @@ def process_machine(machine_name):
             "status": "running"
         }
         
-        # This function now handles its own error states and returns None or output
-        job_output_text = poll_job_status(job_id) # This can take time
+        job_output_text = poll_job_status(job_id) 
         
-        # Ensure job is removed from active_jobs once polling is done, regardless of outcome
         if job_id in APP_STATE["active_jobs"]:
             del APP_STATE["active_jobs"][job_id]
 
-        if job_output_text is not None: # job_output can be empty string if successful but no output
-            # Parse the new structured output
+        if job_output_text is not None: 
             results = parse_job_output(job_output_text, machine_name) 
             APP_STATE["completed_jobs"][job_id] = {
-                "machine": results.get("serverName", machine_name), # Use server name from results if available
-                "status": results.get("executionStatus", "completed").lower(), # Use executionStatus
+                "machine": results.get("serverName", machine_name), 
+                "status": results.get("executionStatus", "completed").lower(), 
                 "completion_time": datetime.now().isoformat(), 
-                "results": results # Store the full structured results
+                "results": results 
             }
-            # Add to server_results for reporting (this list is cleared after each report)
             APP_STATE["server_results"].append(results) 
             logger.info(f"Completed processing for {results.get('serverName', machine_name)}: {results.get('totalUpdates', 0)} updates, {len(results.get('failedUpdates', []))} failed. Execution Status: {results.get('executionStatus')}")
-        else: # poll_job_status returned None, indicating failure or timeout
+        else: 
             logger.error(f"Failed to get output or job failed for job {job_id} (machine: {machine_name}).")
             APP_STATE["completed_jobs"][job_id] = {
                 "machine": machine_name, "status": "failed",
                 "error": "Job failed, timed out, or no output received from Azure.",
                 "completion_time": datetime.now().isoformat(),
-                "results": {"serverName": machine_name, "executionStatus": "Failed", "errorMessage": "Job polling failed or timed out."} # Add minimal results
+                "results": {"serverName": machine_name, "executionStatus": "Failed", "errorMessage": "Job polling failed or timed out."} 
             }
         
-        check_all_complete() # Check if all jobs are done after this one
+        check_all_complete() 
     
     except Exception as e:
         logger.error(f"Unhandled error in process_machine for {machine_name}: {str(e)}")
         logger.exception(f"Traceback for process_machine {machine_name}:")
         
-        # Ensure job is removed from active_jobs if an exception occurred before it was normally removed
         if job_id and job_id in APP_STATE["active_jobs"]:
             del APP_STATE["active_jobs"][job_id]
 
@@ -440,14 +394,12 @@ def process_machine(machine_name):
             "machine": machine_name, "status": "error",
             "error": f"Unhandled exception: {str(e)}",
             "completion_time": datetime.now().isoformat(),
-            "results": {"serverName": machine_name, "executionStatus": "Error", "errorMessage": str(e)} # Add minimal results
+            "results": {"serverName": machine_name, "executionStatus": "Error", "errorMessage": str(e)} 
         }
         check_all_complete()
 
 
 def update_requirements():
-    """Install required packages for Excel support if they're not already installed.
-       This should ideally be handled by requirements.txt and deployment process."""
     missing_packages = []
     try:
         import openpyxl
@@ -467,9 +419,8 @@ def update_requirements():
             args = [sys.executable, "-m", "pip", "install"] + missing_packages
             subprocess.check_call(args)
             logger.info(f"Successfully installed {', '.join(missing_packages)}")
-            # Attempt to re-import after installing
             if "openpyxl" in missing_packages:
-                global openpyxl # Make it available globally if installed this session
+                global openpyxl 
                 import openpyxl
             if "xlrd" in missing_packages:
                 global xlrd
@@ -490,14 +441,12 @@ def run_azure_runbook(machine_name):
     try:
         webhook_url = app.config['AZURE_WEBHOOK_URL']
         payload = {"ComputerName": machine_name}
-        # Increased timeout for webhook trigger
         response = requests.post(webhook_url, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
         
-        # Check for successful acceptance (202), but also other 2xx codes that might indicate success.
         if 200 <= response.status_code < 300:
             try:
                 result = response.json()
-                job_ids = result.get('JobIds') # Webhook response format
+                job_ids = result.get('JobIds') 
                 if job_ids and isinstance(job_ids, list) and len(job_ids) > 0:
                     job_id = job_ids[0]
                     logger.info(f"Runbook started for {machine_name}, Job ID: {job_id}")
@@ -514,7 +463,7 @@ def run_azure_runbook(machine_name):
     except requests.exceptions.Timeout:
         logger.error(f"Timeout triggering Azure runbook for {machine_name}.")
         return None
-    except requests.exceptions.RequestException as e: # Catch other request errors
+    except requests.exceptions.RequestException as e: 
         logger.error(f"Error running Azure runbook for {machine_name}: {str(e)}")
         return None
     except Exception as e:
@@ -528,7 +477,7 @@ def poll_job_status(job_id):
     access_token = get_azure_token()
     if not access_token:
         logger.error(f"Failed to get Azure access token for polling job {job_id}. Cannot proceed.")
-        return None # Critical: cannot proceed without token
+        return None 
         
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
     
@@ -543,15 +492,15 @@ def poll_job_status(job_id):
                   f"/resourceGroups/{resource_group}/providers/Microsoft.Automation"
                   f"/automationAccounts/{automation_account}/jobs/{job_id}/output?api-version=2019-06-01")
     
-    max_attempts = 30  # e.g., 30 attempts * 20 seconds = 10 minutes
-    poll_interval = 20 # seconds
+    max_attempts = 30  
+    poll_interval = 20 
     attempt = 0
     
     while attempt < max_attempts:
         logger.info(f"Polling attempt {attempt + 1}/{max_attempts} for job {job_id}...")
         try:
-            response = requests.get(status_url, headers=headers, timeout=30) # Timeout for status request
-            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            response = requests.get(status_url, headers=headers, timeout=30) 
+            response.raise_for_status() 
             
             job_status_data = response.json()
             status = job_status_data.get('properties', {}).get('status')
@@ -559,49 +508,43 @@ def poll_job_status(job_id):
 
             if status == 'Completed':
                 logger.info(f"Job {job_id} completed. Fetching output.")
-                # Fetch output
                 try:
-                    output_response = requests.get(output_url, headers=headers, timeout=60) # Longer timeout for output
+                    output_response = requests.get(output_url, headers=headers, timeout=60) 
                     output_response.raise_for_status()
-                    # It's safer to return raw text as output can be varied. Parsing is done later.
                     raw_output = output_response.text 
                     logger.debug(f"Raw output received for job {job_id} (first 200 chars): {raw_output[:200]}")
-                    return raw_output # Return raw output string
+                    return raw_output 
                 except requests.exceptions.HTTPError as e_out:
                     logger.error(f"HTTP error fetching output for completed job {job_id}: {e_out.response.status_code} - {e_out.response.text}")
-                    return "" # Return empty string if output fetching fails but job completed
+                    return "" 
                 except requests.exceptions.RequestException as e_out:
                     logger.error(f"Request error fetching output for job {job_id}: {str(e_out)}")
-                    return "" # Return empty string on other request errors for output
+                    return "" 
                 except Exception as e_out:
                     logger.error(f"Unexpected error fetching output for job {job_id}: {str(e_out)}")
                     return ""
 
             elif status in ['Failed', 'Suspended', 'Stopped']:
                 logger.error(f"Job {job_id} ended with unrecoverable status: {status}. Details: {job_status_data.get('properties', {}).get('exception', 'No exception details')}")
-                return None # Indicates job failure
+                return None 
 
-            # For other statuses like 'Running', 'Queued', etc., continue polling
-            
         except requests.exceptions.HTTPError as e_stat:
             logger.error(f"HTTP error polling status for job {job_id}: {e_stat.response.status_code} - {e_stat.response.text}")
-            # Depending on the error (e.g., 401 Unauthorized), retrying might be futile.
-            # For now, we continue retrying up to max_attempts.
         except requests.exceptions.Timeout:
             logger.warning(f"Timeout polling status for job {job_id} on attempt {attempt + 1}.")
-        except requests.exceptions.RequestException as e_stat: # Catch other request errors
+        except requests.exceptions.RequestException as e_stat: 
             logger.error(f"Request error polling status for job {job_id}: {str(e_stat)}")
         except json.JSONDecodeError:
             logger.error(f"Failed to decode JSON status response for job {job_id}. Response text: {response.text if 'response' in locals() else 'N/A'}")
-        except Exception as e_stat: # Catch any other unexpected error
+        except Exception as e_stat: 
             logger.error(f"Unexpected error during job status poll for {job_id}: {str(e_stat)}")
 
         attempt += 1
-        if attempt < max_attempts: # Only sleep if not the last attempt
+        if attempt < max_attempts: 
             time.sleep(poll_interval)
 
     logger.error(f"Max polling attempts ({max_attempts}) reached for job {job_id}. Assuming job timed out or failed to complete in expected time.")
-    return None # Indicates timeout or persistent failure
+    return None 
 
 def get_azure_token():
     client_id = app.config['AZURE_CLIENT_ID']
@@ -618,9 +561,8 @@ def get_azure_token():
         "client_secret": client_secret, "resource": "https://management.azure.com/"
     }
     try:
-        # Timeout for token request
         response = requests.post(token_url, data=payload, timeout=20)
-        response.raise_for_status() # Raise HTTPError for bad responses
+        response.raise_for_status() 
         
         token_data = response.json()
         access_token = token_data.get('access_token')
@@ -640,26 +582,22 @@ def get_azure_token():
     except json.JSONDecodeError:
         logger.error(f"Failed to decode JSON response when getting Azure token. Response: {response.text if 'response' in locals() else 'N/A'}")
         return None
-    except Exception as e: # Catch any other unexpected error
+    except Exception as e: 
         logger.error(f"Unexpected error getting Azure token: {str(e)}")
         return None
 
 # --- Output Parsing ---
 
 def parse_job_output(job_output_text, server_name_fallback):
-    """
-    Parses the structured JSON output from the PowerShell runbook.
-    """
     logger.info(f"Attempting to parse job output for server fallback: {server_name_fallback}")
     
-    # Default structure for results, mirroring PowerShell's $finalOutput
     parsed_results = {
         "serverName": server_name_fallback,
-        "executionStatus": "ParsingError", # Default if parsing fails
+        "executionStatus": "ParsingError", 
         "errorMessage": "Failed to parse job output.",
         "updateHistory": [],
         "diagnosticChecks": {},
-        "timestampUTC": datetime.utcnow().isoformat(), # Timestamp of parsing
+        "timestampUTC": datetime.utcnow().isoformat(), 
         "rawOutputExcerpt": (job_output_text[:500] + "..." if len(job_output_text) > 500 else job_output_text) if job_output_text else "No output text received"
     }
 
@@ -669,26 +607,20 @@ def parse_job_output(job_output_text, server_name_fallback):
         return parsed_results
 
     try:
-        # The entire output from PowerShell is expected to be a single JSON object
         data = json.loads(job_output_text)
         
-        # Overwrite defaults with data from PowerShell if available
         parsed_results["serverName"] = data.get("ComputerName", server_name_fallback)
         parsed_results["executionStatus"] = data.get("ExecutionStatus", "UnknownStatusFromScript")
-        parsed_results["errorMessage"] = data.get("ErrorMessage") # Can be null if success
-        parsed_results["timestampUTC"] = data.get("TimestampUTC", parsed_results["timestampUTC"]) # Use PS timestamp if available
+        parsed_results["errorMessage"] = data.get("ErrorMessage") 
+        parsed_results["timestampUTC"] = data.get("TimestampUTC", parsed_results["timestampUTC"]) 
         
-        # Update History
-        # The PowerShell script already formats UpdateHistory nicely.
-        # We just need to ensure it's a list and handle potential nulls.
         update_history_from_ps = data.get("UpdateHistory")
         if isinstance(update_history_from_ps, list):
             parsed_results["updateHistory"] = update_history_from_ps
-        elif update_history_from_ps is not None: # If it's not a list but not null, log warning
+        elif update_history_from_ps is not None: 
             logger.warning(f"UpdateHistory from PowerShell for {parsed_results['serverName']} was not a list: {type(update_history_from_ps)}")
-            parsed_results["updateHistory"] = [] # Default to empty list
+            parsed_results["updateHistory"] = [] 
         
-        # Diagnostic Checks
         diagnostic_checks_from_ps = data.get("DiagnosticChecks")
         if isinstance(diagnostic_checks_from_ps, dict):
             parsed_results["diagnosticChecks"] = diagnostic_checks_from_ps
@@ -696,10 +628,7 @@ def parse_job_output(job_output_text, server_name_fallback):
             logger.warning(f"DiagnosticChecks from PowerShell for {parsed_results['serverName']} was not a dict: {type(diagnostic_checks_from_ps)}")
             parsed_results["diagnosticChecks"] = {}
 
-        # Aggregate update counts for convenience, similar to the old flat structure's needs
-        # This part is more about preparing for the `generate_ai_report` function's existing expectations
-        # if we want to keep its prompt generation logic similar.
-        parsed_results["allUpdates"] = parsed_results["updateHistory"] # For compatibility with old report prompt
+        parsed_results["allUpdates"] = parsed_results["updateHistory"] 
         parsed_results["totalUpdates"] = len(parsed_results["updateHistory"])
         parsed_results["failedUpdates"] = [
             upd for upd in parsed_results["updateHistory"] 
@@ -716,12 +645,10 @@ def parse_job_output(job_output_text, server_name_fallback):
     except json.JSONDecodeError as e:
         logger.error(f"Failed to decode JSON from job output for {server_name_fallback}: {e}")
         parsed_results["errorMessage"] = f"Output was not valid JSON: {e}. Raw output excerpt in 'rawOutputExcerpt'."
-        # Keep rawOutputExcerpt already set
     except Exception as e:
         logger.error(f"Unexpected error parsing job output for {server_name_fallback}: {e}")
         logger.exception("Detailed traceback for parse_job_output error:")
         parsed_results["errorMessage"] = f"General parsing error: {e}. Raw output excerpt in 'rawOutputExcerpt'."
-        # Keep rawOutputExcerpt already set
 
     return parsed_results
 
@@ -729,224 +656,242 @@ def parse_job_output(job_output_text, server_name_fallback):
 # --- Results Processing ---
 
 def check_all_complete():
-    # This function is called after each job finishes or fails.
-    # It checks if there are any jobs still active.
     if APP_STATE["active_jobs"]:
         logger.info(f"{len(APP_STATE['active_jobs'])} job(s) still active. Report generation deferred.")
         return
 
-    # No active jobs, proceed if there are server results to report on.
     if not APP_STATE["server_results"]:
         logger.info("All jobs complete, but no server results to report for this batch.")
-        # APP_STATE["completed_jobs"] is NOT cleared here, so they persist for UI display
-        # until explicitly cleared by user or full reset.
         return 
     
     logger.info("All jobs complete for the current batch and server results are present. Aggregating and generating report.")
     try:
-        # Create a snapshot of the results for this report run
-        current_server_results = list(APP_STATE["server_results"]) # Make a copy
+        current_server_results = list(APP_STATE["server_results"]) 
         
         aggregate_results = {
-            "serverResults": current_server_results,
-            "totalServers": len(current_server_results),
-            "serversWithFailures": len([s for s in current_server_results if s.get("hasFailures", False) or "fail" in s.get("executionStatus","").lower() or "error" in s.get("executionStatus","").lower()]),
-            "totalFailedUpdates": sum(len(s.get("failedUpdates", [])) for s in current_server_results)
+            "serverResults": current_server_results, # This is the list of parsed_results dicts
+            "totalServersProcessed": len(current_server_results),
+            # Other aggregate stats can be calculated here if needed by generate_ai_report directly
         }
         
-        # Generate and send report in a background thread to avoid blocking
         threading.Thread(target=generate_and_send_report, args=(aggregate_results,), daemon=True).start()
         logger.info("Report generation and sending initiated in a background thread.")
         
-        # Clear ONLY server_results for the next batch. Completed_jobs persist.
         APP_STATE["server_results"].clear()
         logger.info("Live server_results cleared after initiating report for current batch. Completed_jobs persist for UI.")
 
     except Exception as e:
         logger.error(f"Error in check_all_complete while preparing for report generation: {str(e)}")
         logger.exception("Detailed traceback for check_all_complete error:")
-        # Attempt to clear server_results even on error to prevent stale data build-up for next batch.
         APP_STATE["server_results"].clear()
         logger.warning("Cleared server_results after error in check_all_complete.")
 
 
 def generate_and_send_report(aggregate_results_snapshot):
-    """Generates AI report and sends email. Operates on a snapshot of results."""
-    report_content = "Error: Report generation failed." # Default error report
+    report_content = "Error: Report generation failed." 
+    servers_requiring_attention_count = 0 # Default
     try:
         logger.info("Background thread: Generating AI report.")
-        # Pass the snapshot to generate_ai_report
-        report_content = generate_ai_report(aggregate_results_snapshot) 
-        logger.info("Background thread: AI Report generated. Attempting to send email.")
-        send_email_notification(report_content)
+        # generate_ai_report now returns a tuple: (report_string, servers_requiring_attention_count)
+        report_content, servers_requiring_attention_count = generate_ai_report(aggregate_results_snapshot) 
+        
+        logger.info(f"Background thread: AI Report generated. Servers requiring attention: {servers_requiring_attention_count}. Attempting to send email.")
+        send_email_notification(report_content, servers_requiring_attention_count) # Pass the count
         logger.info("Background thread: Email notification sent successfully.")
     except Exception as e:
         logger.error(f"Background thread: Error during report generation or email sending: {str(e)}")
         logger.exception("Detailed traceback for generate_and_send_report background thread:")
-        # Try to send a fallback email with whatever report content was generated (or error message)
-        # or a template report if AI generation failed badly.
         try:
+            # Recalculate sra_count for template based on its own logic if AI failed early
+            # For simplicity, we'll use the sra_count from the failed AI attempt if available,
+            # or re-evaluate for the template.
+            # The template report will internally filter and count.
+            sra_count_for_fallback_subject = servers_requiring_attention_count # Use count from AI attempt if available
+            
             if "Error: Report generation failed." in report_content or not report_content.strip():
                 logger.info("Background thread: AI report generation seems to have failed, using template for fallback email.")
+                # Template report will calculate its own sra_count for its content.
+                # We need a reliable sra_count for the subject line of the fallback email.
+                # Let's re-calculate based on the input snapshot for the subject.
+                sra_count_for_fallback_subject = 0
+                if aggregate_results_snapshot and aggregate_results_snapshot.get("serverResults"):
+                    for sr_item in aggregate_results_snapshot["serverResults"]:
+                        if sr_item.get("failedUpdates") and len(sr_item.get("failedUpdates")) > 0:
+                            sra_count_for_fallback_subject += 1
+                
                 fallback_report_content = "ERROR: AI report generation failed or an error occurred during the main report process. A template-based summary is provided below.\n\n"
-                fallback_report_content += generate_template_report(aggregate_results_snapshot) # Use snapshot
+                fallback_report_content += generate_template_report(aggregate_results_snapshot) 
             else:
-                # An error occurred after report_content was (partially) generated.
                 fallback_report_content = "NOTICE: An error occurred after the initial report generation. The report content below might be incomplete or reflect the state before the error.\n\n" + report_content
             
-            send_email_notification(fallback_report_content)
+            send_email_notification(fallback_report_content, sra_count_for_fallback_subject) # Use the determined count
             logger.info("Background thread: Fallback email notification sent.")
         except Exception as email_error:
             logger.error(f"Background thread: Failed to send fallback email notification: {str(email_error)}")
     finally:
         logger.info("Background thread: generate_and_send_report task finished.")
-        # APP_STATE["server_results"] and APP_STATE["completed_jobs"] are cleared by check_all_complete
-        # after this thread is spawned. This function operates on a snapshot.
 
 
 # --- AI Integration ---
 def generate_ai_report(results_snapshot):
-    logger.info("Generating AI report...")
-    try:
-        server_results_data = results_snapshot.get("serverResults", [])
+    logger.info("Generating AI report with new structure...")
+    server_results_data = results_snapshot.get("serverResults", [])
 
-        if not server_results_data:
-            logger.warning("No server results data in snapshot to generate AI report from. Using template.")
-            return generate_template_report(results_snapshot)
+    # Filter servers for the report: only those with failed updates
+    servers_for_detailed_report = []
+    all_server_data_with_flags = [] # For broader context if needed by AI for conclusion
 
-        prompt = "You are a system administrator assistant analyzing Windows update and server health information.\n\n"
-        prompt += "Review the following data from all processed servers:\n\n"
+    for sr_item in server_results_data:
+        has_failed_updates = sr_item.get("failedUpdates") and len(sr_item.get("failedUpdates")) > 0
         
-        servers_with_issues = 0 # Broadened from just update failures
-        total_failed_updates_count = 0
-        
-        for server_data in server_results_data:
-            server_name = server_data.get("serverName", "Unknown Server")
-            execution_status = server_data.get("executionStatus", "Unknown")
-            error_message_from_script = server_data.get("errorMessage")
-            update_history = server_data.get("updateHistory", [])
-            failed_updates_on_server = server_data.get("failedUpdates", [])
-            diagnostics = server_data.get("diagnosticChecks", {})
-            
-            current_server_has_issues = False
-            if "fail" in execution_status.lower() or "error" in execution_status.lower() or error_message_from_script:
-                current_server_has_issues = True
-            if failed_updates_on_server:
-                current_server_has_issues = True
-                total_failed_updates_count += len(failed_updates_on_server)
-            
-            # Check diagnostic statuses for issues
-            disk_c_status = diagnostics.get("DiskC", {}).get("Status", "OK")
-            if "low" in disk_c_status.lower() or "error" in disk_c_status.lower():
-                current_server_has_issues = True
-            
-            pending_reboot_info = diagnostics.get("PendingReboot", {})
-            if pending_reboot_info.get("IsPending") == True: # Explicitly check for True
-                current_server_has_issues = True
-
-            arc_conn_status = diagnostics.get("ArcConnectivity", {}).get("Status", "OK")
-            if "issues" in arc_conn_status.lower() or "error" in arc_conn_status.lower():
-                current_server_has_issues = True
-            
-            cbs_log_status = diagnostics.get("CBSLog", {}).get("Status", "NoObviousErrors")
-            if "issuesfound" in cbs_log_status.lower() or "error" in cbs_log_status.lower(): # "PotentialIssuesFound"
-                current_server_has_issues = True
-
-            service_checks = diagnostics.get("Services", {})
-            for service_name, service_info in service_checks.items():
-                if isinstance(service_info, dict) and service_info.get("Status") != "Running" and service_info.get("Status") != "NotFound": # NotFound is ok if service is optional
-                    current_server_has_issues = True
-                    break 
-            
-            if current_server_has_issues:
-                servers_with_issues += 1
-
-            prompt += f"## Server: {server_name}\n"
-            prompt += f"- Overall Execution Status: {execution_status}\n"
-            if error_message_from_script:
-                prompt += f"- Script Error Message: {error_message_from_script}\n"
-
-            # Update History Summary for this server
-            prompt += f"- Update History (Last {len(update_history)} relevant entries):\n"
-            if update_history:
-                for upd in update_history:
-                    prompt += f"  - Date: {upd.get('Date', 'N/A')}, Status: {upd.get('Status', 'N/A')}, KB: {upd.get('UpdateKB', 'N/A')}, Title: {upd.get('Title', 'N/A')}\n"
-                if failed_updates_on_server:
-                    prompt += f"  - FAILED UPDATES ON THIS SERVER: {len(failed_updates_on_server)}\n"
-            else:
-                prompt += "  - No relevant update history found or provided.\n"
-
-            # Diagnostic Checks Summary for this server
-            prompt += "- Diagnostic Checks:\n"
-            prompt += f"  - Disk C: Status: {disk_c_status}, Details: {diagnostics.get('DiskC', {}).get('Details', 'N/A')}\n"
-            
-            reboot_details = pending_reboot_info.get('Details', 'N/A')
-            prompt += f"  - Pending Reboot: {'Yes' if pending_reboot_info.get('IsPending') else 'No'}. Reasons: {reboot_details if pending_reboot_info.get('IsPending') else 'N/A'}\n"
-
-            prompt += f"  - Azure Arc Connectivity: Status: {arc_conn_status}, Details: {diagnostics.get('ArcConnectivity', {}).get('Details', 'N/A')}\n"
-            if diagnostics.get("ArcConnectivity", {}).get("UnreachableCoreEndpoints"):
-                prompt += f"    - Unreachable Arc Endpoints: {', '.join(diagnostics['ArcConnectivity']['UnreachableCoreEndpoints'])}\n"
-
-            prompt += f"  - CBS Log: Status: {cbs_log_status}, Findings: {diagnostics.get('CBSLog', {}).get('Findings', 'N/A')}\n"
-            if diagnostics.get("CBSLog", {}).get("ExampleErrorLines"):
-                 prompt += f"    - CBS Log Excerpts: {'; '.join(diagnostics['CBSLog']['ExampleErrorLines'])}\n"
-            
-            prompt += "  - Monitored Services:\n"
-            for service_name, service_info in service_checks.items():
-                if isinstance(service_info, dict): # Ensure it's a dict
-                    prompt += f"    - {service_name}: Status: {service_info.get('Status', 'N/A')}, StartType: {service_info.get('StartType', 'N/A')}\n"
-            prompt += "\n" # Newline after each server's block
-
-        prompt += f"\n## Overall Summary Across All Servers ({len(server_results_data)} Processed):\n"
-        prompt += f"- Servers with any reported issues (update failures, diagnostic warnings, or script errors): {servers_with_issues}\n"
-        prompt += f"- Total specific Windows Update installation failures recorded: {total_failed_updates_count}\n\n"
-        
-        prompt += "Please provide a concise executive summary. Start by stating the total number of servers processed and how many had any issues. "
-        prompt += "Then, for each server with issues, briefly list the server name and the key problems (e.g., 'Update KB123 failed', 'Low Disk Space', 'Arc Unreachable', 'Service X not running'). "
-        prompt += "Conclude with clear, actionable recommendations for addressing the identified problems, prioritizing critical issues. "
-        prompt += "If no issues were detected on any server, state this clearly.\n"
-        prompt += "\nIMPORTANT: If any servers had issues, ensure these are explicitly mentioned. Do not state 'no issues' if any server reported problems."
-        
-        logger.info(f"AI Prompt (length: {len(prompt)} chars). Preview (first 500):\n{prompt[:500]}...")
-        
-        ai_provider = app.config.get('AI_PROVIDER', 'template').lower() 
-        logger.info(f"Using AI provider: {ai_provider}")
-        
-        actual_has_any_issues = servers_with_issues > 0
-
-        if ai_provider == 'openai':
-            return generate_openai_report(prompt, actual_has_any_issues)
-        elif ai_provider == 'ollama':
-            return generate_ollama_report(prompt, actual_has_any_issues)
-        elif ai_provider == 'vllm':
-            return generate_vllm_report(prompt, actual_has_any_issues)
+        # Check for any diagnostic issues on this server
+        has_diagnostic_issues = False
+        diagnostics = sr_item.get("diagnosticChecks", {})
+        if "low" in diagnostics.get("DiskC", {}).get("Status", "OK").lower() or \
+           diagnostics.get("PendingReboot", {}).get("IsPending") == True:
+            has_diagnostic_issues = True
         else:
-            logger.info(f"AI provider '{ai_provider}' not configured or unknown. Using template report.")
-            return generate_template_report(results_snapshot) 
+            for service_name, service_info in diagnostics.get("Services", {}).items():
+                if isinstance(service_info, dict) and service_info.get("Status") != "Running" and service_info.get("Status") != "NotFound":
+                    has_diagnostic_issues = True
+                    break
+            if not has_diagnostic_issues and ("issues" in diagnostics.get("ArcConnectivity", {}).get("Status", "OK").lower() or \
+                                           "issuesfound" in diagnostics.get("CBSLog", {}).get("Status", "NoObviousErrors").lower()):
+                has_diagnostic_issues = True
+        
+        all_server_data_with_flags.append({**sr_item, "_has_failed_updates": has_failed_updates, "_has_diagnostic_issues": has_diagnostic_issues})
+
+        if has_failed_updates:
+            servers_for_detailed_report.append(sr_item)
+
+    total_servers_evaluated = len(server_results_data)
+    servers_requiring_attention_count = len(servers_for_detailed_report)
+
+    if not server_results_data:
+        logger.warning("No server results data in snapshot to generate AI report from. Using template.")
+        # Ensure template also adheres to new structure and returns count
+        return generate_template_report(results_snapshot), 0 
+
+    prompt = "You are a system administrator assistant. Generate a 'Server Patch Status and Health Check Report'.\n"
+    prompt += "Adhere strictly to the following section titles and formatting style inspired by the user's example.\n\n"
+
+    prompt += "Executive Summary\n"
+    prompt += f"- Metric: Total Servers Evaluated, Count: {total_servers_evaluated}\n"
+    prompt += f"- Metric: Servers Requiring Attention (due to failed updates), Count: {servers_requiring_attention_count}\n\n"
+
+    prompt += "Detailed Issue Overview\n"
+    if not servers_for_detailed_report:
+        prompt += "All servers successfully applied updates. No servers require detailing for failed updates in this section.\n\n"
+    else:
+        for i, server_data in enumerate(servers_for_detailed_report):
+            server_name = server_data.get("serverName", "Unknown Server")
+            diagnostics = server_data.get("diagnosticChecks", {})
+            failed_updates = server_data.get("failedUpdates", []) # Should have items
+
+            prompt += f"{i + 1}. Server: {server_name}\n"
+            
+            # Failed Updates (Primary reason for inclusion)
+            prompt += "    Failed Updates:\n"
+            for upd in failed_updates:
+                prompt += f"        - KB: {upd.get('UpdateKB', 'N/A')}, Title: {upd.get('Title', 'N/A')}, Status: {upd.get('Status', 'N/A')}\n"
+
+            # Accompanying Diagnostic Issues for these servers
+            disk_c_info = diagnostics.get("DiskC", {})
+            if "low" in disk_c_info.get("Status", "OK").lower():
+                prompt += f"    Disk Space Alert:\n        Drive C: {disk_c_info.get('Details', 'N/A')}\n"
+
+            pending_reboot_info = diagnostics.get("PendingReboot", {})
+            if pending_reboot_info.get("IsPending") == True:
+                prompt += f"    Pending Actions:\n        Pending reboot ({pending_reboot_info.get('Details', 'N/A')})\n"
+            
+            service_issues_texts = []
+            service_checks = diagnostics.get("Services", {})
+            for svc_name, svc_info in service_checks.items():
+                if isinstance(svc_info, dict):
+                    s_status = svc_info.get("Status", "N/A")
+                    s_start_type = svc_info.get("StartType", "N/A")
+                    if s_status != "Running" and s_status != "NotFound":
+                        service_issues_texts.append(f"{svc_name} {s_status.lower()} (Startup Type: {s_start_type})")
+            
+            arc_details = diagnostics.get("ArcConnectivity", {}).get("Details", "")
+            if "issues" in diagnostics.get("ArcConnectivity", {}).get("Status", "OK").lower():
+                 service_issues_texts.append(f"Azure Arc Connectivity: {arc_details if arc_details else diagnostics.get('ArcConnectivity')['Status']}")
+
+
+            if service_issues_texts:
+                prompt += "    Service Issues:\n"
+                for issue_text in service_issues_texts:
+                    prompt += f"        - {issue_text}\n"
+            prompt += "\n" # Newline after each server in detailed overview
+        prompt += "\n"
+
+
+    prompt += "Actionable Recommendations\n"
+    if not servers_for_detailed_report:
+        prompt += "No specific recommendations as no servers reported failed updates requiring detailed attention.\n\n"
+    else:
+        prompt += "Based on the 'Detailed Issue Overview', provide numbered, categorized recommendations. For each, state the 'Immediate Action'.\n"
+        prompt += "Example categories: Failed Update Remediation (specify server), Disk Management (specify server), Pending Reboot Resolution (specify server), Service Management (specify services and startup type changes but if a service is stopped and set to Manual as the start type, ignore since that wouldn't be running constantly anyways. If one is stopped but set to automatic that is an issue), Azure Arc Agent Verification (specify server). We do not use GuestConfigAgent service so don't add that into any checks\n"
+        # Provide hints for recommendations based on the issues found in servers_for_detailed_report
+        recommendation_hints = []
+        for server_data in servers_for_detailed_report:
+            s_name = server_data.get("serverName")
+            recommendation_hints.append(f"For {s_name}: Address {len(server_data.get('failedUpdates',[]))} failed update(s).")
+            # Add hints for other issues if present on these servers
+            # (Disk, Reboot, Services, Arc as done in the detailed overview prompt construction)
+        prompt += "Consider these points for recommendations: " + "; ".join(recommendation_hints) + "\n\n"
+
+
+    prompt += "Conclusion\n"
+    if servers_requiring_attention_count == 0:
+        prompt += "All evaluated servers have successfully applied recent patches. "
+        any_diag_issues_overall = any(s['_has_diagnostic_issues'] for s in all_server_data_with_flags if not s['_has_failed_updates'])
+        if any_diag_issues_overall:
+            prompt += "Some servers may have minor diagnostic alerts (not detailed here as updates were successful) that can be reviewed through system logs for routine maintenance.\n"
+        else:
+            prompt += "No critical issues or failed updates were detected that require immediate attention.\n"
+    else:
+        prompt += "Summarize the situation for the servers detailed in the 'Detailed Issue Overview'. State that these servers require attention for failed updates and any listed diagnostic issues. "
+        prompt += "Comment on the patch status of other servers not detailed (if applicable, e.g., 'Other X servers successfully applied all patches.'). "
+        prompt += "Emphasize the need to address the identified problems promptly to ensure operational stability and compliance.\n"
     
-    except Exception as e:
-        logger.error(f"Error generating AI report: {str(e)}")
-        logger.exception("Detailed traceback for AI report generation error:")
-        return generate_template_report(results_snapshot) 
+    prompt += "\nIMPORTANT: Ensure the output strictly follows the section titles: 'Executive Summary', 'Detailed Issue Overview', 'Actionable Recommendations', 'Conclusion'. Use formatting (like numbered lists, bullet points, bolding for emphasis)"
+
+    logger.info(f"AI Prompt (length: {len(prompt)} chars). Preview (first 500):\n{prompt[:500]}...")
+    
+    ai_provider = app.config.get('AI_PROVIDER', 'template').lower() 
+    logger.info(f"Using AI provider: {ai_provider}")
+    
+    report_text = ""
+    if ai_provider == 'openai':
+        report_text = generate_openai_report(prompt, servers_requiring_attention_count > 0)
+    elif ai_provider == 'ollama':
+        report_text = generate_ollama_report(prompt, servers_requiring_attention_count > 0)
+    elif ai_provider == 'vllm':
+        report_text = generate_vllm_report(prompt, servers_requiring_attention_count > 0)
+    else:
+        logger.info(f"AI provider '{ai_provider}' not configured or unknown. Using template report.")
+        report_text = generate_template_report(results_snapshot) # Template report will also return string only now
+    
+    # If AI failed and returned template, sra_count might not be from AI logic.
+    # The sra_count returned should be the one used for filtering for this report.
+    return report_text, servers_requiring_attention_count
 
 
-def _validate_ai_response(ai_generated_text, model_name, provider_name, actual_has_issues): # Changed parameter name
-    """Helper function to validate AI response regarding issue reporting."""
-    if actual_has_issues: # Check if any issues were present
-        # Keywords to look for if issues were expected to be mentioned
-        issue_keywords = ["fail", "failed", "failure", "unsuccessful", "error", "issue", "problem", "warning", "critical", "unreachable", "low space", "not running"]
+def _validate_ai_response(ai_generated_text, model_name, provider_name, actual_has_failed_updates): 
+    if actual_has_failed_updates: 
+        issue_keywords = ["fail", "failed", "failure", "unsuccessful", "error", "issue", "problem", "warning", "critical", "unreachable", "low space", "not running", "remediation", "address"]
         if not any(keyword in ai_generated_text.lower() for keyword in issue_keywords):
             warning_message = (
-                f"⚠️ AI VALIDATION NOTICE: Issues were present in the data, but the AI summary from "
-                f"{provider_name} model '{model_name}' might not have explicitly acknowledged them. "
+                f"⚠️ AI VALIDATION NOTICE: Failed updates were present, but the AI summary from "
+                f"{provider_name} model '{model_name}' might not have explicitly acknowledged them or recommended actions. "
                 f"Please review detailed logs and the AI output carefully. ⚠️\n\n"
             )
-            logger.warning(f"AI Validation: {provider_name} model '{model_name}' response seems to miss issue mentions when issues exist.")
+            logger.warning(f"AI Validation: {provider_name} model '{model_name}' response seems to miss issue mentions when failed updates exist.")
             return warning_message + ai_generated_text
     return ai_generated_text
 
-def generate_ollama_report(prompt, actual_has_issues): # Changed parameter name
-    """Generate a report using Ollama with enhanced logging and validation"""
+def generate_ollama_report(prompt, actual_has_failed_updates): 
     ollama_url = app.config.get('OLLAMA_URL', 'http://host.docker.internal:11434/api/generate')
     ollama_model = app.config.get('OLLAMA_MODEL', 'mistral')
     logger.info(f"Connecting to Ollama at: {ollama_url} with model: {ollama_model}")
@@ -972,7 +917,7 @@ def generate_ollama_report(prompt, actual_has_issues): # Changed parameter name
             return "ERROR: Ollama returned an empty response.\n\n" + generate_template_report({"serverResults": []}) 
 
         logger.info(f"Ollama report generated (length: {len(result)}). First 100 chars: {result[:100]}")
-        return _validate_ai_response(result, ollama_model, "Ollama", actual_has_issues) # Pass actual_has_issues
+        return _validate_ai_response(result, ollama_model, "Ollama", actual_has_failed_updates) 
 
     except requests.exceptions.HTTPError as e:
         logger.error(f"Ollama HTTP error (model '{ollama_model}'): {e.response.status_code} - {e.response.text[:500]}")
@@ -995,7 +940,7 @@ def generate_ollama_report(prompt, actual_has_issues): # Changed parameter name
         return f"ERROR: An unexpected error occurred with Ollama AI service.\n\n" + generate_template_report({"serverResults": []})
 
 
-def generate_openai_report(prompt, actual_has_issues): # Changed parameter name
+def generate_openai_report(prompt, actual_has_failed_updates): 
     openai.api_key = app.config.get('OPENAI_API_KEY')
     openai_model = app.config.get('OPENAI_MODEL', 'gpt-3.5-turbo')
 
@@ -1010,11 +955,11 @@ def generate_openai_report(prompt, actual_has_issues): # Changed parameter name
         response = client.chat.completions.create(
             model=openai_model,
             messages=[
-                {"role": "system", "content": "You are a system administrator expert analyzing Windows updates and server health. Provide clear, concise, and actionable summaries."},
+                {"role": "system", "content": "You are a system administrator expert. Generate a 'Server Patch Status and Health Check Report' following the user's detailed structure and instructions precisely."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.3,
-            max_tokens=2000 # Increased for more detailed diagnostic reporting
+            temperature=0.2, # Slightly lower for more deterministic structured output
+            max_tokens=2500 
         )
         request_time = time.time() - start_time
         logger.info(f"OpenAI request completed in {request_time:.2f}s.")
@@ -1025,7 +970,7 @@ def generate_openai_report(prompt, actual_has_issues): # Changed parameter name
              return "ERROR: OpenAI returned an empty response.\n\n" + generate_template_report({"serverResults": []})
 
         logger.info(f"OpenAI report generated (length: {len(report_content)}). First 100 chars: {report_content[:100]}")
-        return _validate_ai_response(report_content, openai_model, "OpenAI", actual_has_issues) # Pass actual_has_issues
+        return _validate_ai_response(report_content, openai_model, "OpenAI", actual_has_failed_updates) 
 
     except openai.APIConnectionError as e:
         logger.error(f"OpenAI API Connection Error: {str(e)}")
@@ -1042,7 +987,7 @@ def generate_openai_report(prompt, actual_has_issues): # Changed parameter name
         return f"ERROR: Error generating report with OpenAI: {str(e)}\n\n" + generate_template_report({"serverResults": []})
 
 
-def generate_vllm_report(prompt, actual_has_issues): # Changed parameter name
+def generate_vllm_report(prompt, actual_has_failed_updates): 
     logger.info("Attempting to generate report using VLLM")
     vllm_url = app.config.get('VLLM_CHAT_COMPLETIONS_URL')
     vllm_model = app.config.get('VLLM_MODEL')
@@ -1060,11 +1005,11 @@ def generate_vllm_report(prompt, actual_has_issues): # Changed parameter name
     payload = {
         "model": vllm_model,
         "messages": [
-            {"role": "system", "content": "You are a system administrator expert analyzing Windows updates and server health. Provide clear, concise, and actionable summaries."},
+            {"role": "system", "content": "You are a system administrator expert. Generate a 'Server Patch Status and Health Check Report' following the user's detailed structure and instructions precisely."},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.3, 
-        "max_tokens": 2000 
+        "temperature": 0.2, 
+        "max_tokens": 2500 
     }
     
     logger.info(f"Sending request to VLLM at {vllm_url} with model {vllm_model}. SSL Verify: {vllm_verify_ssl}")
@@ -1087,7 +1032,7 @@ def generate_vllm_report(prompt, actual_has_issues): # Changed parameter name
                     return "ERROR: VLLM returned an empty response content.\n\n" + generate_template_report({"serverResults": []})
                 
                 logger.info(f"VLLM report generated (length: {len(report_content)}). First 100 chars: {report_content[:100]}")
-                return _validate_ai_response(report_content, vllm_model, "VLLM", actual_has_issues) # Pass actual_has_issues
+                return _validate_ai_response(report_content, vllm_model, "VLLM", actual_has_failed_updates) 
             else:
                 logger.error(f"VLLM response missing expected content structure. Message: {message}")
                 return "ERROR: VLLM response malformed (no content in message).\n\n" + generate_template_report({"serverResults": []})
@@ -1117,115 +1062,122 @@ def generate_vllm_report(prompt, actual_has_issues): # Changed parameter name
 
 
 def generate_template_report(results_data): 
-    """Generates a basic, template-based report including diagnostic checks."""
     if results_data is None: results_data = {} 
 
-    total_servers = results_data.get("totalServers", 0)
-    # servers_with_failures is now calculated based on any issue in generate_ai_report,
-    # but for template, we can be more direct or use the passed aggregate.
-    # For simplicity, let's re-evaluate based on the detailed serverResults data.
-    server_results_list = results_data.get("serverResults", [])
-    
-    servers_with_any_issues = 0
-    for sr in server_results_list:
-        if sr.get("hasFailures") or "fail" in sr.get("executionStatus","").lower() or "error" in sr.get("executionStatus","").lower():
-            servers_with_any_issues +=1
-            continue # Already counted
-        diag = sr.get("diagnosticChecks", {})
-        if "low" in diag.get("DiskC", {}).get("Status", "").lower() or \
-           diag.get("PendingReboot", {}).get("IsPending") == True or \
-           "issues" in diag.get("ArcConnectivity", {}).get("Status", "").lower() or \
-           "issuesfound" in diag.get("CBSLog", {}).get("Status", "").lower():
-            servers_with_any_issues +=1
-            continue
-        for s_name, s_info in diag.get("Services", {}).items():
-            if isinstance(s_info, dict) and s_info.get("Status") != "Running" and s_info.get("Status") != "NotFound":
-                servers_with_any_issues +=1
-                break 
-    
-    total_failed_updates_count = results_data.get("totalFailedUpdates", 0)
+    server_results_list_from_data = results_data.get("serverResults", [])
+    servers_for_template_report = []
+    all_server_data_with_flags_template = []
 
-    report = "Windows Update & Server Health Summary Report (Template)\n"
+    for sr_item in server_results_list_from_data:
+        has_failed_updates = sr_item.get("failedUpdates") and len(sr_item.get("failedUpdates")) > 0
+        
+        has_diagnostic_issues = False
+        diagnostics = sr_item.get("diagnosticChecks", {})
+        if "low" in diagnostics.get("DiskC", {}).get("Status", "OK").lower() or \
+           diagnostics.get("PendingReboot", {}).get("IsPending") == True:
+            has_diagnostic_issues = True
+        # Simplified check for other diagnostics for template
+        elif diagnostics.get("Services") or diagnostics.get("ArcConnectivity") or diagnostics.get("CBSLog"): 
+            has_diagnostic_issues = True # Assume any entry here is an issue for template simplicity
+
+        all_server_data_with_flags_template.append({**sr_item, "_has_failed_updates": has_failed_updates, "_has_diagnostic_issues": has_diagnostic_issues})
+
+        if has_failed_updates:
+            servers_for_template_report.append(sr_item)
+
+    total_servers_evaluated_template = len(server_results_list_from_data)
+    servers_requiring_attention_template = len(servers_for_template_report)
+
+    report = "Server Patch Status and Health Check Report (Template)\n"
     report += "=======================================================\n\n"
     report += f"Date of Report: {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}\n\n"
     
-    report += f"Overall Statistics:\n"
-    report += f"  Total Servers Processed: {total_servers}\n"
-    report += f"  Servers With Any Reported Issues: {servers_with_any_issues}\n"
-    report += f"  Total Windows Update Installation Failures: {total_failed_updates_count}\n\n"
+    report += "Executive Summary\n"
+    report += "-----------------\n"
+    report += f"Total Servers Evaluated: {total_servers_evaluated_template}\n"
+    report += f"Servers Requiring Attention (due to failed updates): {servers_requiring_attention_template}\n\n"
     
-    if servers_with_any_issues > 0 and server_results_list:
-        report += "Details of Servers with Issues:\n"
-        report += "-------------------------------------\n"
-        for server_info in server_results_list:
-            # Determine if this server has issues to report in the template
+    report += "Detailed Issue Overview\n"
+    report += "-----------------------\n"
+    if not servers_for_template_report:
+        report += "All servers successfully applied updates. No servers require detailing for failed updates in this section.\n\n"
+    else:
+        for i, server_info in enumerate(servers_for_template_report):
             server_name = server_info.get("serverName", "Unknown Server")
-            execution_status = server_info.get("executionStatus", "Unknown")
-            error_message = server_info.get("errorMessage")
-            update_history = server_info.get("updateHistory", [])
-            failed_updates = server_info.get("failedUpdates", [])
             diagnostics = server_info.get("diagnosticChecks", {})
+            failed_updates = server_info.get("failedUpdates", [])
+
+            report += f"{i + 1}. Server: {server_name}\n"
             
-            issues_on_this_server_text = []
-            if "fail" in execution_status.lower() or "error" in execution_status.lower() or error_message:
-                issues_on_this_server_text.append(f"Script Execution: {execution_status}" + (f" (Error: {error_message})" if error_message else ""))
             if failed_updates:
-                issues_on_this_server_text.append(f"Update Failures: {len(failed_updates)} update(s)")
-            
-            # Diagnostic issues
+                report += "    Failed Updates:\n"
+                for upd in failed_updates:
+                    report += f"        - KB: {upd.get('UpdateKB', 'N/A')}, Title: {upd.get('Title', 'N/A')}, Status: {upd.get('Status', 'N/A')}\n"
+
             disk_info = diagnostics.get("DiskC", {})
-            if "low" in disk_info.get("Status", "").lower(): issues_on_this_server_text.append(f"Disk C: {disk_info.get('Details', 'Low space')}")
+            if "low" in disk_info.get("Status", "OK").lower():
+                report += f"    Disk Space Alert:\n        Drive C: {disk_info.get('Details', 'N/A')}\n"
+
+            pending_reboot_info = diagnostics.get("PendingReboot", {})
+            if pending_reboot_info.get("IsPending") == True:
+                report += f"    Pending Actions:\n        Pending reboot ({pending_reboot_info.get('Details', 'N/A')})\n"
             
-            reboot_info = diagnostics.get("PendingReboot", {})
-            if reboot_info.get("IsPending"): issues_on_this_server_text.append(f"Pending Reboot: Yes ({reboot_info.get('Reasons', 'N/A')})")
-
-            arc_info = diagnostics.get("ArcConnectivity", {})
-            if "issues" in arc_info.get("Status", "").lower(): issues_on_this_server_text.append(f"Arc Connectivity: {arc_info.get('Details', 'Issues')}")
-
-            cbs_info = diagnostics.get("CBSLog", {})
-            if "issuesfound" in cbs_info.get("Status", "").lower(): issues_on_this_server_text.append(f"CBS Log: {cbs_info.get('Findings', 'Potential issues')}")
-
-            service_issues = []
-            for s_name, s_info in diagnostics.get("Services", {}).items():
-                if isinstance(s_info, dict) and s_info.get("Status") != "Running" and s_info.get("Status") != "NotFound":
-                    service_issues.append(f"{s_name} ({s_info.get('Status')})")
-            if service_issues: issues_on_this_server_text.append(f"Service Issues: {', '.join(service_issues)}")
-
-            if not issues_on_this_server_text: continue # Skip server if no template-worthy issues found
-
-            report += f"\nServer: {server_name}\n"
-            for issue_text in issues_on_this_server_text:
-                report += f"  - {issue_text}\n"
+            service_issues_texts = []
+            service_checks = diagnostics.get("Services", {})
+            for svc_name, svc_info in service_checks.items():
+                if isinstance(svc_info, dict):
+                    s_status = svc_info.get("Status", "N/A")
+                    s_start_type = svc_info.get("StartType", "N/A")
+                    if s_status != "Running" and s_status != "NotFound":
+                        service_issues_texts.append(f"{svc_name} {s_status.lower()} (Startup Type: {s_start_type})")
             
-            if failed_updates:
-                report += "    Failed Update Details:\n"
-                for i, upd in enumerate(failed_updates):
-                    report += f"      - KB: {upd.get('UpdateKB', 'N/A')}, Title: {upd.get('Title', 'N/A')}, Status: {upd.get('Status', 'N/A')}\n"
-            report += "-------------------------------------\n"
+            arc_details = diagnostics.get("ArcConnectivity", {}).get("Details", "")
+            if "GuestConfigAgent service not found" in arc_details or "GuestConfigAgent not installed" in arc_details:
+                 service_issues_texts.append("GuestConfigAgent not installed")
+            elif "issues" in diagnostics.get("ArcConnectivity", {}).get("Status", "OK").lower():
+                 service_issues_texts.append(f"Azure Arc Connectivity: {arc_details if arc_details else diagnostics.get('ArcConnectivity')['Status']}")
 
-    elif total_servers > 0:
-        report += "Status: No significant issues detected across all processed servers.\n"
-    else:
-        report += "Status: No servers were processed, or no results available to report.\n"
+            if service_issues_texts:
+                report += "    Service Issues:\n"
+                for issue_text in service_issues_texts:
+                    report += f"        - {issue_text}\n"
+            report += "\n"
+    report += "\n"
 
-    report += "\nRecommendations:\n"
-    if servers_with_any_issues > 0:
-        report += "- Prioritize servers with 'CriticalLow' disk space or 'ConnectionIssues' for Azure Arc.\n"
-        report += "- Investigate specific failed updates and service issues on the identified servers.\n"
-        report += "- If pending reboots are detected, schedule them as appropriate.\n"
-        report += "- For CBS log issues, further manual log analysis might be required on the server.\n"
-    elif total_servers > 0 :
-        report += "- All processed servers appear to be healthy and updates applied successfully according to the checks.\n"
-        report += "- Continue routine monitoring.\n"
+    report += "Actionable Recommendations\n"
+    report += "--------------------------\n"
+    if not servers_for_template_report:
+        report += "No specific recommendations as no servers reported failed updates.\n"
     else:
-        report += "- No specific recommendations as no server processing data is available.\n"
+        report += "- For servers listed in 'Detailed Issue Overview':\n"
+        report += "  - Investigate and remediate all listed 'Failed Updates'.\n"
+        report += "  - Address any 'Disk Space Alert' by freeing up or expanding storage.\n"
+        report += "  - Perform required actions for 'Pending Actions' (e.g., schedule reboots).\n"
+        report += "  - For 'Service Issues': Start stopped services. Consider changing startup types to 'Automatic' for critical services. Investigate 'GuestConfigAgent not installed' by checking Azure Arc agent status.\n"
+    report += "\n"
+
+    report += "Conclusion\n"
+    report += "----------\n"
+    if servers_requiring_attention_template == 0:
+        report += "All evaluated servers have successfully applied recent patches. "
+        any_diag_issues_overall_template = any(s['_has_diagnostic_issues'] for s in all_server_data_with_flags_template if not s['_has_failed_updates'])
+        if any_diag_issues_overall_template:
+            report += "Review system logs for any minor diagnostic alerts on successfully patched servers for routine maintenance.\n"
+        else:
+            report += "No critical issues or failed updates were detected.\n"
+    else:
+        report += f"{servers_requiring_attention_template} server(s) require attention for failed updates and potentially other listed issues. "
+        other_successful_count = total_servers_evaluated_template - servers_requiring_attention_template
+        if other_successful_count > 0:
+            report += f"The other {other_successful_count} server(s) successfully applied all patches. "
+        report += "Address the identified problems promptly.\n"
     
-    report += "\nEnd of Report.\n"
+    report += "\nEnd of Template Report.\n"
     return report
 
 # --- Email Notification ---
 
-def send_email_notification(report_body):
+def send_email_notification(report_body, servers_requiring_attention_count): # Added servers_requiring_attention_count
     logger.info("Attempting to send email notification.")
     try:
         from_email = app.config['EMAIL_FROM']
@@ -1243,7 +1195,9 @@ def send_email_notification(report_body):
         msg['From'] = from_email
         msg['To'] = to_email
         report_date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        subject_status = "Issues Detected" if "fail" in report_body.lower() or "error" in report_body.lower() or "issue" in report_body.lower() or "critical" in report_body.lower() else "All Clear"
+        
+        # Updated subject status logic
+        subject_status = "Action Required" if servers_requiring_attention_count > 0 else "All Clear"
         msg['Subject'] = f'PatchMate Server Health & Update Report - {report_date_str} - Status: {subject_status}'
         
         msg.attach(MIMEText(report_body, 'plain', 'utf-8')) 
@@ -1355,7 +1309,6 @@ def api_status():
     
     completed_jobs_list = []
     try:
-        # Sort completed jobs by completion_time descending if available, otherwise by job ID as fallback
         sorted_completed_jobs = sorted(
             APP_STATE["completed_jobs"].items(), 
             key=lambda item: (item[1].get("completion_time", "0") if item[1].get("completion_time") else "0", item[0]),
@@ -1366,25 +1319,19 @@ def api_status():
         sorted_completed_jobs = APP_STATE["completed_jobs"].items()
 
     for job_id, job_info in sorted_completed_jobs:
-        job_data = {"id": job_id, **job_info} # Start with all info from job_info
+        job_data = {"id": job_id, **job_info} 
         
-        # Extract and simplify results for the status API to keep it lean
-        # The full results are still in APP_STATE["completed_jobs"][job_id]["results"]
         if "results" in job_info and isinstance(job_info["results"], dict):
             results_summary = job_info["results"]
             job_data["total_updates_in_job"] = results_summary.get("totalUpdates", 0)
             job_data["failed_updates_in_job"] = len(results_summary.get("failedUpdates", []))
             job_data["execution_status_from_script"] = results_summary.get("executionStatus", "Unknown")
             job_data["script_error_message"] = results_summary.get("errorMessage")
-            # Include a snippet of raw output if available from parsing
             job_data["raw_output_excerpt"] = results_summary.get("rawOutputExcerpt", "N/A")
 
-
-        # Ensure 'status' in job_data reflects the script's executionStatus if available
-        # or the overall job status set by process_machine
-        job_data["status"] = job_info.get("status", "unknown") # This is the overarching job status
+        job_data["status"] = job_info.get("status", "unknown") 
         if "results" in job_info and isinstance(job_info["results"], dict) and job_info["results"].get("executionStatus"):
-             job_data["status"] = job_info["results"]["executionStatus"].lower() # Override with script status if more specific
+             job_data["status"] = job_info["results"]["executionStatus"].lower() 
 
         completed_jobs_list.append(job_data)
 
@@ -1439,7 +1386,7 @@ def api_ai_provider_models():
     fetch_url = None
     provider_name_for_log = "Unknown"
     current_model_value = "N/A"
-    vllm_verify_ssl = app.config.get('VLLM_VERIFY_SSL', True) # Get SSL verification for VLLM
+    vllm_verify_ssl = app.config.get('VLLM_VERIFY_SSL', True) 
 
     if ai_provider == 'ollama':
         ollama_url_config = app.config.get('OLLAMA_URL', 'http://host.docker.internal:11434/api/generate')
@@ -1493,7 +1440,7 @@ def api_ai_provider_models():
         if ai_provider == 'vllm':
             if app.config.get('VLLM_API_KEY'):
                 headers["Authorization"] = f"Bearer {app.config['VLLM_API_KEY']}"
-            request_kwargs['verify'] = vllm_verify_ssl # Apply SSL verification for VLLM
+            request_kwargs['verify'] = vllm_verify_ssl 
 
         response = requests.get(fetch_url, **request_kwargs)
         response.raise_for_status()
@@ -1564,7 +1511,7 @@ def api_set_ai_model():
 
 @app.route('/api/clear-transient-data', methods=['POST']) 
 def api_clear_transient_data():
-    APP_STATE["completed_jobs"].clear() # This is the primary target for this button now
+    APP_STATE["completed_jobs"].clear() 
     APP_STATE["server_results"].clear() 
     APP_STATE["processed_files_on_startup"].clear() 
     logger.info("Transient data (completed jobs, server results, processed file list for session) cleared via API.")
@@ -1575,7 +1522,7 @@ def api_clear_transient_data():
 def api_debug_info():
     try:
         debug_info = {
-            "app_version": "1.2.2 (Job Display Fix)", 
+            "app_version": "1.2.3 (Report Format Update)", 
             "flask_debug_mode": app.debug,
             "current_time_utc": datetime.utcnow().isoformat(),
             "monitor_active": APP_STATE["monitor_active"],
@@ -1597,26 +1544,24 @@ def api_debug_info():
         }
         
         test_ai_param = request.args.get('test_ai_report', 'false').lower()
-        if test_ai_param == 'true' and APP_STATE["completed_jobs"]: # Test with completed jobs if server_results is empty
-            logger.info("Debug: Generating test AI report based on a sample of completed_jobs data.")
-            # Create a sample aggregate from completed_jobs if server_results is empty
-            # This is a simplified sample for testing the prompt with new structure
-            sample_server_results_for_test = [job.get("results") for job in list(APP_STATE["completed_jobs"].values()) if job.get("results")]
-            if sample_server_results_for_test:
+        if test_ai_param == 'true':
+            sample_results_for_test_report = []
+            if APP_STATE["server_results"]: # Prefer current batch if available
+                 sample_results_for_test_report = APP_STATE["server_results"]
+            elif APP_STATE["completed_jobs"]:
+                 sample_results_for_test_report = [job.get("results") for job in list(APP_STATE["completed_jobs"].values()) if job.get("results")]
+
+            if sample_results_for_test_report:
                 test_aggregate_results = {
-                    "serverResults": sample_server_results_for_test[:3], # Test with up to 3
-                    "totalServers": len(sample_server_results_for_test[:3]),
-                    "serversWithFailures": len([s for s in sample_server_results_for_test[:3] if s.get("hasFailures", False) or "fail" in s.get("executionStatus","").lower() or "error" in s.get("executionStatus","").lower()]),
-                    "totalFailedUpdates": sum(len(s.get("failedUpdates", [])) for s in sample_server_results_for_test[:3])
+                    "serverResults": sample_results_for_test_report[:3], 
                 }
-                report_test_content = generate_ai_report(test_aggregate_results)
+                report_test_content, sra_count = generate_ai_report(test_aggregate_results)
                 debug_info["test_ai_report_preview"] = report_test_content[:1000] + "..." if len(report_test_content) > 1000 else report_test_content
                 debug_info["test_ai_report_provider_used"] = app.config.get('AI_PROVIDER')
+                debug_info["test_ai_report_sra_count"] = sra_count
             else:
-                debug_info["test_ai_report_message"] = "No completed jobs with parsable results found to generate a test report."
-        elif test_ai_param == 'true':
-             debug_info["test_ai_report_message"] = "No server results or completed jobs with results available to generate a test report."
-
+                debug_info["test_ai_report_message"] = "No server results or completed jobs with results available to generate a test report."
+        
         return jsonify(debug_info), 200
     except Exception as e:
         logger.error(f"Error in /api/debug-info: {str(e)}")
@@ -1657,7 +1602,7 @@ def api_system_info():
                     excel_support_status = "Neither openpyxl nor xlrd found."
 
         info = {
-            "application_version": "1.2.2 (Job Display Fix)", 
+            "application_version": "1.2.3 (Report Format Update)", 
             "python_version": sys.version,
             "platform_details": f"{os.name} - {sys.platform}",
             "watch_directory_configured": watch_dir_config,
@@ -1714,3 +1659,4 @@ if __name__ == '__main__':
         port=port_num,
         debug=app.config.get('DEBUG', False),
     )
+
