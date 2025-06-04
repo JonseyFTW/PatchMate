@@ -23,7 +23,7 @@ import pandas as pd
 import openai
 import asyncio
 from pyppeteer import launch
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 # import openpyxl # Imported dynamically in update_requirements
 
 # Configure logging
@@ -92,30 +92,32 @@ def fetch_page_content(url):
 
 
 # --- Web Search for Update Fix Resources ---
-def search_update_resolution(kb_number, os_name='Windows', max_results=5):
-    """Search the web for potential fixes related to the KB and return links."""
+def search_update_resolution(kb_number, os_name="Windows", max_results=5):
+    """Search the web using Playwright for potential fixes related to the KB."""
     query = f"{kb_number} {os_name} update failed fix"
+    links = []
     try:
-        response = requests.get(
-            "https://www.bing.com/search",
-            params={"q": query},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
-        )
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        links_raw = [a.get("href") for a in soup.select("li.b_algo h2 a")]
-        links = []
-        for link in links_raw:
-            if not link:
-                continue
-            links.append(link)
-            if len(links) >= max_results:
-                break
+        from urllib.parse import quote_plus
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            search_url = f"https://www.bing.com/search?q={quote_plus(query)}"
+            page.goto(search_url, timeout=15000)
+            page.wait_for_selector("li.b_algo h2 a", timeout=5000)
+            anchors = page.query_selector_all("li.b_algo h2 a")
+            for a in anchors:
+                href = a.get_attribute("href")
+                if href:
+                    links.append(href)
+                    if len(links) >= max_results:
+                        break
+            browser.close()
         links.sort(key=lambda url: 0 if ("microsoft" in url.lower() or "reddit" in url.lower()) else 1)
         return links[:max_results]
     except Exception as e:
-        logger.error(f"Search error for KB {kb_number}: {str(e)}")
+        logger.error(f"Playwright search error for KB {kb_number}: {str(e)}")
         return []
 
 
@@ -1303,7 +1305,31 @@ def generate_template_report(results_data):
 
 # --- Email Notification ---
 
-def send_email_notification(report_body, servers_requiring_attention_count): # Added servers_requiring_attention_count
+def convert_report_to_html(report_text):
+    """Convert plain/markdown report text to simple HTML for email."""
+    from html import escape
+    try:
+        import markdown as md
+        html_core = md.markdown(report_text)
+    except Exception as e:
+        logger.error(f"Markdown conversion failed: {e}. Falling back to <pre> block.")
+        html_core = f"<pre>{escape(report_text)}</pre>"
+    return f"<html><body style='font-family: Arial, sans-serif;'>{html_core}</body></html>"
+
+
+def convert_report_to_html(report_text):
+    """Convert plain/markdown report text to simple HTML for email."""
+    from html import escape
+    try:
+        import markdown as md
+        html_core = md.markdown(report_text)
+    except Exception as e:
+        logger.error(f"Markdown conversion failed: {e}. Falling back to <pre> block.")
+        html_core = f"<pre>{escape(report_text)}</pre>"
+    return f"<html><body style='font-family: Arial, sans-serif;'>{html_core}</body></html>"
+
+
+def send_email_notification(report_body, servers_requiring_attention_count):# Added servers_requiring_attention_count
     logger.info("Attempting to send email notification.")
     try:
         from_email = app.config['EMAIL_FROM']
@@ -1317,7 +1343,7 @@ def send_email_notification(report_body, servers_requiring_attention_count): # A
             logger.error("Email configuration (FROM, TO, SERVER) is incomplete. Cannot send email.")
             return
 
-        msg = MIMEMultipart()
+        msg = MIMEMultipart('alternative')
         msg['From'] = from_email
         msg['To'] = to_email
         report_date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -1326,7 +1352,9 @@ def send_email_notification(report_body, servers_requiring_attention_count): # A
         subject_status = "Action Required" if servers_requiring_attention_count > 0 else "All Clear"
         msg['Subject'] = f'PatchMate Server Health & Update Report - {report_date_str} - Status: {subject_status}'
         
-        msg.attach(MIMEText(report_body, 'plain', 'utf-8')) 
+        msg.attach(MIMEText(report_body, 'plain', 'utf-8'))
+        html_body = convert_report_to_html(report_body)
+        msg.attach(MIMEText(html_body, 'html', 'utf-8'))
         
         with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as server: 
             server.ehlo() 
