@@ -21,6 +21,9 @@ from watchdog.observers.polling import PollingObserver
 from datetime import datetime
 import pandas as pd
 import openai
+import asyncio
+from pyppeteer import launch
+from playwright.sync_api import sync_playwright
 # import openpyxl # Imported dynamically in update_requirements
 
 # Configure logging
@@ -69,6 +72,54 @@ def initialize_app_state():
 
 # Initialize app state when module is loaded
 initialize_app_state()
+
+
+# --- Simple Puppeteer Integration for Web Fetching ---
+async def _fetch_page_content(url):
+    browser = await launch(headless=True, args=['--no-sandbox'])
+    page = await browser.newPage()
+    await page.goto(url)
+    content = await page.content()
+    await browser.close()
+    return content
+
+def fetch_page_content(url):
+    try:
+        return asyncio.get_event_loop().run_until_complete(_fetch_page_content(url))
+    except Exception as e:
+        logger.error(f"Puppeteer error fetching {url}: {str(e)}")
+        return None
+
+
+# --- Web Search for Update Fix Resources ---
+def search_update_resolution(kb_number, os_name="Windows", max_results=5):
+    """Search the web using Playwright for potential fixes related to the KB."""
+    query = f"{kb_number} {os_name} update failed fix"
+    links = []
+    try:
+        from urllib.parse import quote_plus
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            search_url = f"https://www.bing.com/search?q={quote_plus(query)}"
+            page.goto(search_url, timeout=15000)
+            page.wait_for_selector("li.b_algo h2 a", timeout=5000)
+            anchors = page.query_selector_all("li.b_algo h2 a")
+            for a in anchors:
+                href = a.get_attribute("href")
+                if href:
+                    links.append(href)
+                    if len(links) >= max_results:
+                        break
+            browser.close()
+
+        links.sort(key=lambda url: 0 if ("microsoft" in url.lower() or "reddit" in url.lower()) else 1)
+        return links[:max_results]
+    except Exception as e:
+        logger.error(f"Playwright search error for KB {kb_number}: {str(e)}")
+        return []
 
 
 # --- File Monitoring ---
@@ -628,12 +679,20 @@ def parse_job_output(job_output_text, server_name_fallback):
             logger.warning(f"DiagnosticChecks from PowerShell for {parsed_results['serverName']} was not a dict: {type(diagnostic_checks_from_ps)}")
             parsed_results["diagnosticChecks"] = {}
 
-        parsed_results["allUpdates"] = parsed_results["updateHistory"] 
+        parsed_results["allUpdates"] = parsed_results["updateHistory"]
         parsed_results["totalUpdates"] = len(parsed_results["updateHistory"])
         parsed_results["failedUpdates"] = [
-            upd for upd in parsed_results["updateHistory"] 
+            upd for upd in parsed_results["updateHistory"]
             if isinstance(upd, dict) and "fail" in upd.get("Status", "").lower()
         ]
+
+        # Attempt to add helpful web resources for each failed update
+        os_info = data.get("OSVersion") or data.get("OsVersion") or data.get("OS") or "Windows"
+        for upd in parsed_results["failedUpdates"]:
+            kb = upd.get("UpdateKB")
+            if kb:
+                upd["infoLinks"] = search_update_resolution(kb, os_info)
+
         parsed_results["hasFailures"] = len(parsed_results["failedUpdates"]) > 0 or \
                                        "fail" in parsed_results["executionStatus"].lower() or \
                                        "error" in parsed_results["executionStatus"].lower()
@@ -794,7 +853,11 @@ def generate_ai_report(results_snapshot):
             # Failed Updates (Primary reason for inclusion)
             prompt += "    Failed Updates:\n"
             for upd in failed_updates:
-                prompt += f"        - KB: {upd.get('UpdateKB', 'N/A')}, Title: {upd.get('Title', 'N/A')}, Status: {upd.get('Status', 'N/A')}\n"
+                prompt += f"        - KB: {upd.get('UpdateKB', 'N/A')}, Title: {upd.get('Title', 'N/A')}, Status: {upd.get('Status', 'N/A')}"
+                links = upd.get('infoLinks')
+                if links:
+                    prompt += f" | Links: {'; '.join(links)}"
+                prompt += "\n"
 
             # Accompanying Diagnostic Issues for these servers
             disk_c_info = diagnostics.get("DiskC", {})
@@ -873,6 +936,8 @@ def generate_ai_report(results_snapshot):
         report_text = generate_ollama_report(prompt, servers_requiring_attention_count > 0)
     elif ai_provider == 'vllm':
         report_text = generate_vllm_report(prompt, servers_requiring_attention_count > 0)
+    elif ai_provider == 'qwen':
+        report_text = generate_qwen_agent_report(prompt, servers_requiring_attention_count > 0)
     else:
         logger.info(f"AI provider '{ai_provider}' not configured or unknown. Using template report.")
         report_text = generate_template_report(results_snapshot) # Template report will also return string only now
@@ -991,7 +1056,7 @@ def generate_openai_report(prompt, actual_has_failed_updates):
         return f"ERROR: Error generating report with OpenAI: {str(e)}\n\n" + generate_template_report({"serverResults": []})
 
 
-def generate_vllm_report(prompt, actual_has_failed_updates): 
+def generate_vllm_report(prompt, actual_has_failed_updates):
     logger.info("Attempting to generate report using VLLM")
     vllm_url = app.config.get('VLLM_CHAT_COMPLETIONS_URL')
     vllm_model = app.config.get('VLLM_MODEL')
@@ -1065,6 +1130,62 @@ def generate_vllm_report(prompt, actual_has_failed_updates):
         return f"ERROR: An unexpected error occurred with VLLM service.\n\n" + generate_template_report({"serverResults": []})
 
 
+def generate_qwen_agent_report(prompt, actual_has_failed_updates):
+    logger.info("Attempting to generate report using Qwen Agent")
+    qwen_url = app.config.get('QWEN_AGENT_URL')
+    qwen_model = app.config.get('QWEN_AGENT_MODEL')
+    if not qwen_url or not qwen_model:
+        logger.error("Qwen Agent URL or model not configured.")
+        return "ERROR: Qwen Agent URL or model not configured.\n\n" + generate_template_report({"serverResults": []})
+
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "model": qwen_model,
+        "messages": [
+            {"role": "system", "content": "You are a system administrator expert. Generate a 'Server Patch Status and Health Check Report' following the user's detailed structure and instructions precisely."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.2,
+        "tools": ["browser"]
+    }
+
+    logger.info(f"Sending request to Qwen Agent at {qwen_url} with model {qwen_model}")
+    logger.debug(f"Qwen Agent request payload: {json.dumps(payload, indent=2)}")
+    try:
+        start_time = time.time()
+        response = requests.post(qwen_url, headers=headers, json=payload, timeout=180)
+        request_time = time.time() - start_time
+        logger.info(f"Qwen Agent request completed in {request_time:.2f}s. Status: {response.status_code}")
+
+        response.raise_for_status()
+        json_response = response.json()
+        if json_response.get("choices") and len(json_response["choices"]) > 0:
+            message = json_response["choices"][0].get("message")
+            if message and message.get("content"):
+                report_content = message["content"]
+                if not report_content.strip():
+                    logger.warning("Qwen Agent returned an empty content string.")
+                    return "ERROR: Qwen Agent returned an empty response.\n\n" + generate_template_report({"serverResults": []})
+                logger.info(f"Qwen Agent report generated (length: {len(report_content)}). First 100 chars: {report_content[:100]}")
+                return _validate_ai_response(report_content, qwen_model, "Qwen Agent", actual_has_failed_updates)
+            else:
+                logger.error(f"Qwen Agent response missing expected content structure. Message: {message}")
+                return "ERROR: Qwen Agent response malformed (no content in message).\n\n" + generate_template_report({"serverResults": []})
+        else:
+            logger.error(f"Qwen Agent response missing 'choices' or choices are empty. Response: {json_response}")
+            return "ERROR: Qwen Agent response malformed (no choices or empty choices array).\n\n" + generate_template_report({"serverResults": []})
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error connecting to Qwen Agent service: {str(e)}")
+        return f"ERROR: Cannot connect to Qwen Agent service ({str(e)}).\n\n" + generate_template_report({"serverResults": []})
+    except json.JSONDecodeError as e:
+        logger.error(f"Error parsing Qwen Agent JSON response: {str(e)}. Response text: {response.text[:500] if 'response' in locals() else 'N/A'}")
+        return f"ERROR: Malformed JSON response from Qwen Agent.\n\n" + generate_template_report({"serverResults": []})
+    except Exception as e:
+        logger.error(f"General error with Qwen Agent: {str(e)}")
+        logger.exception("Detailed traceback for Qwen Agent error:")
+        return f"ERROR: An unexpected error occurred with Qwen Agent service.\n\n" + generate_template_report({"serverResults": []})
+
+
 def generate_template_report(results_data): 
     if results_data is None: results_data = {} 
 
@@ -1116,7 +1237,11 @@ def generate_template_report(results_data):
             if failed_updates:
                 report += "    Failed Updates:\n"
                 for upd in failed_updates:
-                    report += f"        - KB: {upd.get('UpdateKB', 'N/A')}, Title: {upd.get('Title', 'N/A')}, Status: {upd.get('Status', 'N/A')}\n"
+                    report += f"        - KB: {upd.get('UpdateKB', 'N/A')}, Title: {upd.get('Title', 'N/A')}, Status: {upd.get('Status', 'N/A')}"
+                    links = upd.get('infoLinks')
+                    if links:
+                        report += f" | Links: {'; '.join(links)}"
+                    report += "\n"
 
             disk_info = diagnostics.get("DiskC", {})
             if "low" in disk_info.get("Status", "OK").lower():
@@ -1181,30 +1306,44 @@ def generate_template_report(results_data):
 
 # --- Email Notification ---
 
-def send_email_notification(report_body, servers_requiring_attention_count): # Added servers_requiring_attention_count
+def convert_report_to_html(report_text):
+    """Convert plain/markdown report text to simple HTML for email."""
+    from html import escape
+    try:
+        import markdown as md
+        html_core = md.markdown(report_text)
+    except Exception as e:
+        logger.error(f"Markdown conversion failed: {e}. Falling back to <pre> block.")
+        html_core = f"<pre>{escape(report_text)}</pre>"
+    return f"<html><body style='font-family: Arial, sans-serif;'>{html_core}</body></html>"
+
+
+def send_email_notification(report_body, servers_requiring_attention_count):
     logger.info("Attempting to send email notification.")
     try:
         from_email = app.config['EMAIL_FROM']
         to_email = app.config['EMAIL_TO']
         smtp_server = app.config['SMTP_SERVER']
-        smtp_port = int(app.config.get('SMTP_PORT', 25)) 
-        smtp_user = app.config.get('SMTP_USERNAME') 
-        smtp_pass = app.config.get('SMTP_PASSWORD') 
-        
+        smtp_port = int(app.config.get('SMTP_PORT', 25))
+        smtp_user = app.config.get('SMTP_USERNAME')
+        smtp_pass = app.config.get('SMTP_PASSWORD')
+
         if not all([from_email, to_email, smtp_server]):
             logger.error("Email configuration (FROM, TO, SERVER) is incomplete. Cannot send email.")
             return
 
-        msg = MIMEMultipart()
+        msg = MIMEMultipart('alternative')
         msg['From'] = from_email
         msg['To'] = to_email
         report_date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        
+
         # Updated subject status logic
         subject_status = "Action Required" if servers_requiring_attention_count > 0 else "All Clear"
         msg['Subject'] = f'PatchMate Server Health & Update Report - {report_date_str} - Status: {subject_status}'
-        
-        msg.attach(MIMEText(report_body, 'plain', 'utf-8')) 
+
+        msg.attach(MIMEText(report_body, 'plain', 'utf-8'))
+        html_body = convert_report_to_html(report_body)
+        msg.attach(MIMEText(html_body, 'html', 'utf-8'))
         
         with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as server: 
             server.ehlo() 
@@ -1367,7 +1506,7 @@ def api_set_ai_provider():
         data = request.json
         new_provider = data.get('provider')
         
-        if not new_provider or new_provider.lower() not in ['ollama', 'vllm', 'openai', 'template']:
+        if not new_provider or new_provider.lower() not in ['ollama', 'vllm', 'openai', 'qwen', 'template']:
             return jsonify({"status": "error", "message": "Invalid or missing AI provider specified."}), 400
         
         app.config['AI_PROVIDER'] = new_provider.lower()
@@ -1420,14 +1559,22 @@ def api_ai_provider_models():
             common_openai_models.append({"name": current_openai_model, "description": "Currently configured model."})
         
         return jsonify({
-            "status": "success", 
+            "status": "success",
             "provider": "openai",
             "current_model": current_openai_model,
-            "models": common_openai_models 
+            "models": common_openai_models
         }), 200
-    else: 
+    elif ai_provider == 'qwen':
+        current_qwen_model = app.config.get('QWEN_AGENT_MODEL', 'Qwen3-32B')
         return jsonify({
-            "status": "success", 
+            "status": "success",
+            "provider": "qwen",
+            "current_model": current_qwen_model,
+            "models": [{"name": current_qwen_model, "description": "Configured model"}]
+        }), 200
+    else:
+        return jsonify({
+            "status": "success",
             "provider": ai_provider,
             "current_model": "N/A (template or unknown provider)",
             "models": []
@@ -1500,6 +1647,8 @@ def api_set_ai_model():
             config_key_to_set = 'VLLM_MODEL'
         elif provider == 'openai':
             config_key_to_set = 'OPENAI_MODEL'
+        elif provider == 'qwen':
+            config_key_to_set = 'QWEN_AGENT_MODEL'
         else:
             logger.warning(f"Attempt to set model for an unsupported or template provider: {provider}")
             return jsonify({"status": "error", "message": f"Cannot set model for provider '{provider}'."}), 400
@@ -1542,6 +1691,7 @@ def api_debug_info():
             "config_ollama_model": app.config.get('OLLAMA_MODEL'),
             "config_vllm_model": app.config.get('VLLM_MODEL'),
             "config_openai_model": app.config.get('OPENAI_MODEL'),
+            "config_qwen_model": app.config.get('QWEN_AGENT_MODEL'),
             "config_watch_dir": app.config.get('WATCH_DIRECTORY'),
             "config_upload_dir": app.config.get('UPLOAD_DIRECTORY'),
             "config_vllm_verify_ssl": app.config.get('VLLM_VERIFY_SSL') 
@@ -1614,11 +1764,12 @@ def api_system_info():
             "upload_directory_configured": upload_dir_config,
             "upload_directory_exists": os.path.exists(upload_dir_config), 
             "monitor_is_active": APP_STATE["monitor_active"],
-            "current_runtime_ai_provider": app.config.get('AI_PROVIDER'), 
+            "current_runtime_ai_provider": app.config.get('AI_PROVIDER'),
             "ollama_model_setting": app.config.get('OLLAMA_MODEL'),
             "vllm_model_setting": app.config.get('VLLM_MODEL'),
             "openai_model_setting": app.config.get('OPENAI_MODEL'),
-            "vllm_ssl_verify_setting": app.config.get('VLLM_VERIFY_SSL'), 
+            "qwen_model_setting": app.config.get('QWEN_AGENT_MODEL'),
+            "vllm_ssl_verify_setting": app.config.get('VLLM_VERIFY_SSL'),
             "installed_packages_check": {
                 "pandas": pd.__version__ if 'pd' in globals() and hasattr(pd, '__version__') else "Not imported/found or version unknown",
                 "flask": Flask.__version__ if 'Flask' in globals() and hasattr(Flask, '__version__') else "Not imported/found or version unknown",
@@ -1643,6 +1794,7 @@ if __name__ == '__main__':
     
     logger.info(f"Application starting with AI_PROVIDER set to: {app.config.get('AI_PROVIDER')}")
     logger.info(f"VLLM SSL Verification is set to: {app.config.get('VLLM_VERIFY_SSL')}")
+    logger.info(f"Qwen Agent URL: {app.config.get('QWEN_AGENT_URL')}")
 
 
     if app.config.get('AUTO_START_MONITORING', False):
