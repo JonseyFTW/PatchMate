@@ -23,7 +23,7 @@ AZURE_TENANT_ID = '1a68cf95-dsdfcf728efdf'
 AZURE_WEBHOOK_URL = 'https://cdcdsfc9-ee03-452b-a5c5-392f1720ad.webhook.eus.azure-automation.net/webhooks?token=q9K2TKsJLZ%2fF9RQasmoisdfBjCNO8nICVwG0%3d'
 
 # AI settings
-AI_PROVIDER = os.getenv('AI_PROVIDER', 'vllm')  # 'openai' or 'ollama' or 'vllm'
+AI_PROVIDER = os.getenv('AI_PROVIDER', 'vllm')  # 'openai', 'ollama', 'vllm', or 'qwen'
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', 'your-openai-api-key')
 OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-3.5-turbo')
 
@@ -35,6 +35,10 @@ VLLM_MODELS_URL = os.getenv('VLLM_MODELS_URL', 'https://vllm.contosoresources.co
 VLLM_MODEL = os.getenv('VLLM_MODEL', 'Qwen3-30B-A3B-FP8') # Specify your default VLLM model
 VLLM_API_KEY = os.getenv('VLLM_API_KEY', '123456789') # Add if your VLLM setup requires an API key
 VLLM_VERIFY_SSL = False
+
+# Qwen Agent settings
+QWEN_AGENT_URL = os.getenv('QWEN_AGENT_URL', 'http://localhost:8000/v1/chat/completions')
+QWEN_AGENT_MODEL = os.getenv('QWEN_AGENT_MODEL', 'Qwen3-32B')
 
 
 # Email settings
