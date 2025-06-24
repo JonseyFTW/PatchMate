@@ -279,7 +279,7 @@
                             let updatesInfo = (job.total_updates_in_job !== undefined && job.total_updates_in_job !== null) ? `${job.total_updates_in_job}` : 'N/A';
                             let failedInfo = (job.failed_updates_in_job !== undefined && job.failed_updates_in_job !== null) ? `${job.failed_updates_in_job}` : 'N/A';
                             let rawOutputExcerpt = (job.raw_output_excerpt && typeof job.raw_output_excerpt === 'string') ? job.raw_output_excerpt : '';
-                            let details = job.error ? `<small class="text-muted">Error: ${escapeHtml(job.error)}</small>` : (rawOutputExcerpt ? `<button class="btn btn-xs btn-outline-secondary view-output-btn" data-job='${JSON.stringify(job).replace(/'/g, "&apos;")}' data-machine="${escapeHtml(job.machine)}">View Output</button>` : 'N/A');
+                            let details = job.error ? `<small class="text-muted">Error: ${escapeHtml(job.error)}</small>` : (rawOutputExcerpt ? `<button class="btn btn-xs btn-outline-secondary view-output-btn" data-job-id="${escapeHtml(job.id)}" data-machine="${escapeHtml(job.machine)}">View Output</button>` : 'N/A');
                             
                             if (isSuccessfulStatus && job.failed_updates_in_job > 0) {
                                 statusClass = 'job-status-failed'; 
@@ -309,22 +309,31 @@
             }
             
             $('body').on('click', '.view-output-btn', function() {
-                const jobData = $(this).data('job');
+                const jobId = $(this).data('job-id');
                 const machineName = $(this).data('machine');
                 
                 $('#outputMachine').text(machineName || 'Unknown');
                 
-                let formattedOutput = '';
-                
-                if (jobData && jobData.results) {
-                    const results = jobData.results;
+                // Fetch the job data from the API
+                $.getJSON('/api/status', function(statusData) {
+                    const job = statusData.completed_jobs.find(j => j.id === jobId);
+                    if (!job) {
+                        $('#outputContent').val('Job data not found.');
+                        $('#outputModal').modal('show');
+                        return;
+                    }
                     
-                    formattedOutput += `=== PATCH STATUS SUMMARY ===\n`;
-                    formattedOutput += `Machine: ${jobData.machine || 'Unknown'}\n`;
-                    formattedOutput += `Execution Status: ${results.executionStatus || 'Unknown'}\n`;
-                    formattedOutput += `Total Updates Found: ${results.totalUpdates || 0}\n`;
-                    formattedOutput += `Failed Updates: ${results.failedUpdates ? results.failedUpdates.length : 0}\n`;
-                    formattedOutput += `Timestamp: ${results.timestampUTC || 'Unknown'}\n\n`;
+                    let formattedOutput = '';
+                    
+                    if (job && job.results) {
+                        const results = job.results;
+                    
+                        formattedOutput += `=== PATCH STATUS SUMMARY ===\n`;
+                        formattedOutput += `Machine: ${job.machine || 'Unknown'}\n`;
+                        formattedOutput += `Execution Status: ${results.executionStatus || 'Unknown'}\n`;
+                        formattedOutput += `Total Updates Found: ${results.totalUpdates || 0}\n`;
+                        formattedOutput += `Failed Updates: ${results.failedUpdates ? results.failedUpdates.length : 0}\n`;
+                        formattedOutput += `Timestamp: ${results.timestampUTC || 'Unknown'}\n\n`;
                     
                     if (results.updateHistory && results.updateHistory.length > 0) {
                         formattedOutput += `=== UPDATE HISTORY ===\n`;
@@ -371,12 +380,16 @@
                         formattedOutput += `\n=== RAW OUTPUT EXCERPT ===\n`;
                         formattedOutput += `${results.rawOutputExcerpt}\n`;
                     }
-                } else {
-                    formattedOutput = 'No detailed output available for this job.';
-                }
-                
-                $('#outputContent').val(formattedOutput);
-                $('#outputModal').modal('show');
+                    } else {
+                        formattedOutput = 'No detailed output available for this job.';
+                    }
+                    
+                    $('#outputContent').val(formattedOutput);
+                    $('#outputModal').modal('show');
+                }).fail(function() {
+                    $('#outputContent').val('Error loading job data.');
+                    $('#outputModal').modal('show');
+                });
             });
             
             $('#copyOutputBtn').click(function() {
