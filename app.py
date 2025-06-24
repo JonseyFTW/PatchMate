@@ -1,5 +1,3 @@
-# app.py - Main application file with Excel and CSV support
-
 import os
 import csv
 import time
@@ -21,8 +19,6 @@ from watchdog.observers.polling import PollingObserver
 from datetime import datetime
 import pandas as pd
 import openai
-import asyncio
-from pyppeteer import launch
 from playwright.sync_api import sync_playwright
 # import openpyxl # Imported dynamically in update_requirements
 
@@ -74,28 +70,14 @@ def initialize_app_state():
 initialize_app_state()
 
 
-# --- Simple Puppeteer Integration for Web Fetching ---
-async def _fetch_page_content(url):
-    browser = await launch(headless=True, args=['--no-sandbox'])
-    page = await browser.newPage()
-    await page.goto(url)
-    content = await page.content()
-    await browser.close()
-    return content
-
-def fetch_page_content(url):
-    try:
-        return asyncio.get_event_loop().run_until_complete(_fetch_page_content(url))
-    except Exception as e:
-        logger.error(f"Puppeteer error fetching {url}: {str(e)}")
-        return None
-
-
 # --- Web Search for Update Fix Resources ---
 def search_update_resolution(kb_number, os_name="Windows", max_results=5):
     """Search the web using Playwright for potential fixes related to the KB."""
     query = f"{kb_number} {os_name} update failed fix"
     links = []
+    
+    logger.info(f"🔍 Starting web search for KB: {kb_number} with query: '{query}'")
+    
     try:
         from urllib.parse import quote_plus
         from playwright.sync_api import sync_playwright
@@ -104,20 +86,32 @@ def search_update_resolution(kb_number, os_name="Windows", max_results=5):
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             search_url = f"https://www.bing.com/search?q={quote_plus(query)}"
+            
+            logger.info(f"🌐 Navigating to: {search_url}")
             page.goto(search_url, timeout=15000)
             page.wait_for_selector("li.b_algo h2 a", timeout=5000)
             anchors = page.query_selector_all("li.b_algo h2 a")
+            
+            logger.info(f"📄 Found {len(anchors)} search results for {kb_number}")
+            
             for a in anchors:
                 href = a.get_attribute("href")
                 if href:
                     links.append(href)
+                    logger.info(f"🔗 Found link: {href}")
                     if len(links) >= max_results:
                         break
             browser.close()
+
+        # Prioritize Microsoft and Reddit sources
         links.sort(key=lambda url: 0 if ("microsoft" in url.lower() or "reddit" in url.lower()) else 1)
-        return links[:max_results]
+        
+        final_links = links[:max_results]
+        logger.info(f"✅ Successfully found {len(final_links)} links for {kb_number}: {final_links}")
+        return final_links
+        
     except Exception as e:
-        logger.error(f"Playwright search error for KB {kb_number}: {str(e)}")
+        logger.error(f"❌ Playwright search error for KB {kb_number}: {str(e)}")
         return []
 
 
@@ -709,7 +703,6 @@ def parse_job_output(job_output_text, server_name_fallback):
         parsed_results["errorMessage"] = f"General parsing error: {e}. Raw output excerpt in 'rawOutputExcerpt'."
 
     return parsed_results
-
 
 # --- Results Processing ---
 
