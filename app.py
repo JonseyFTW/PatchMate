@@ -22,7 +22,6 @@ from datetime import datetime
 import pandas as pd
 import openai
 import asyncio
-from pyppeteer import launch
 from playwright.sync_api import sync_playwright
 # import openpyxl # Imported dynamically in update_requirements
 
@@ -73,22 +72,6 @@ def initialize_app_state():
 # Initialize app state when module is loaded
 initialize_app_state()
 
-
-# --- Simple Puppeteer Integration for Web Fetching ---
-async def _fetch_page_content(url):
-    browser = await launch(headless=True, args=['--no-sandbox'])
-    page = await browser.newPage()
-    await page.goto(url)
-    content = await page.content()
-    await browser.close()
-    return content
-
-def fetch_page_content(url):
-    try:
-        return asyncio.get_event_loop().run_until_complete(_fetch_page_content(url))
-    except Exception as e:
-        logger.error(f"Puppeteer error fetching {url}: {str(e)}")
-        return None
 
 
 # --- Web Search for Update Fix Resources ---
@@ -1720,6 +1703,62 @@ def api_debug_info():
     except Exception as e:
         logger.error(f"Error in /api/debug-info: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/test-completed-job')
+def api_test_completed_job():
+    """Test endpoint to simulate a completed job with actual Azure runbook data"""
+    try:
+        # Simulate the actual Azure runbook output you provided
+        test_job_data = {
+            "UpdateHistory": [
+                {"Date": "/Date(1749360381000)/", "Operation": "Installation", "Status": "Succeeded", "UpdateKB": "(KB5058392)", "Title": "2025-05 Cumulative Update for Windows Server 2019 (1809) for x64-based Systems (KB5058392)"},
+                {"Date": "/Date(1746335579000)/", "Operation": "Installation", "Status": "Succeeded", "UpdateKB": "(KB5055519)", "Title": "2025-04 Cumulative Update for Windows Server 2019 (1809) for x64-based Systems (KB5055519)"},
+                {"Date": "/Date(1746335156000)/", "Operation": "Installation", "Status": "Failed", "UpdateKB": "(KB5055681)", "Title": "2025-04 Cumulative Update for .NET Framework 3.5, 4.7.2 and 4.8 for Windows Server 2019 for x64 (KB5055681)"},
+                {"Date": "/Date(1743916458000)/", "Operation": "Installation", "Status": "Succeeded", "UpdateKB": "(KB5053596)", "Title": "2025-03 Cumulative Update for Windows Server 2019 (1809) for x64-based Systems (KB5053596)"}
+            ],
+            "DiagnosticChecks": {
+                "PendingReboot": {"IsPending": True, "Details": "Pending reboot detected. Reasons: Pending File Rename Operations", "Reasons": "Pending File Rename Operations"},
+                "DiskC": {"FreeSpaceGB": 11.79, "Details": "WARNING: 11.79 GB free of 64.19 GB (18.4%) - Less than 20 GB free.", "TotalSpaceGB": 64.19, "PercentFree": 18.4, "Drive": "C", "Status": "WarningLow"}
+            },
+            "ComputerName": "TEST-FTWSQL02",
+            "TimestampUTC": "2025-06-24T13:57:42.8428795Z",
+            "ErrorMessage": None,
+            "ExecutionStatus": "Success",
+            "PSComputerName": "TEST-FTWSQL02"
+        }
+        
+        # Parse the test data using our existing parser
+        parsed_results = parse_job_output(json.dumps(test_job_data), "TEST-FTWSQL02")
+        
+        # Create a fake job ID and add it to completed jobs
+        import uuid
+        test_job_id = str(uuid.uuid4())
+        
+        APP_STATE["completed_jobs"][test_job_id] = {
+            "machine": "TEST-FTWSQL02",
+            "status": parsed_results.get("executionStatus", "success").lower(),
+            "completion_time": datetime.now().isoformat(),
+            "results": parsed_results
+        }
+        
+        logger.info(f"Test job {test_job_id} added to completed jobs with {parsed_results.get('totalUpdates', 0)} total updates and {len(parsed_results.get('failedUpdates', []))} failed updates")
+        
+        return jsonify({
+            "status": "success",
+            "message": f"Test completed job created with ID: {test_job_id}",
+            "job_data": {
+                "id": test_job_id,
+                "machine": "TEST-FTWSQL02",
+                "total_updates": parsed_results.get("totalUpdates", 0),
+                "failed_updates": len(parsed_results.get("failedUpdates", [])),
+                "execution_status": parsed_results.get("executionStatus", "Success")
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error creating test job: {str(e)}")
+        return jsonify({"status": "error", "message": f"Failed to create test job: {str(e)}"}), 500
 
 
 @app.route('/api/reload-templates', methods=['POST']) 

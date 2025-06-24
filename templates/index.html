@@ -264,6 +264,10 @@
                     if (data.completed_jobs && data.completed_jobs.length > 0) {
                         data.completed_jobs.forEach(job => {
                             let statusClass = `job-status-${job.status.toLowerCase()}`;
+                            
+                            // Debug: Log job data to console for troubleshooting (remove for production)
+                            // console.log('Job data debug:', job);
+                            
                             // Check if job has update data (successful or completed status with numeric values)
                             let hasUpdateData = (job.total_updates_in_job !== undefined && job.total_updates_in_job !== null) || 
                                               (job.failed_updates_in_job !== undefined && job.failed_updates_in_job !== null);
@@ -271,10 +275,11 @@
                                                    job.status.toLowerCase() === 'success' || 
                                                    job.status.toLowerCase() === 'successful');
                             
-                            let updatesInfo = (isSuccessfulStatus && hasUpdateData) ? `${job.total_updates_in_job || 0}` : 'N/A';
-                            let failedInfo = (isSuccessfulStatus && hasUpdateData) ? `${job.failed_updates_in_job || 0}` : 'N/A';
+                            // Always show the numbers if they exist, regardless of status
+                            let updatesInfo = (job.total_updates_in_job !== undefined && job.total_updates_in_job !== null) ? `${job.total_updates_in_job}` : 'N/A';
+                            let failedInfo = (job.failed_updates_in_job !== undefined && job.failed_updates_in_job !== null) ? `${job.failed_updates_in_job}` : 'N/A';
                             let rawOutputExcerpt = (job.raw_output_excerpt && typeof job.raw_output_excerpt === 'string') ? job.raw_output_excerpt : '';
-                            let details = job.error ? `<small class="text-muted">Error: ${escapeHtml(job.error)}</small>` : (rawOutputExcerpt ? `<button class="btn btn-xs btn-outline-secondary view-output-btn" data-output="${escapeHtml(rawOutputExcerpt)}" data-machine="${escapeHtml(job.machine)}">View Output</button>` : 'N/A');
+                            let details = job.error ? `<small class="text-muted">Error: ${escapeHtml(job.error)}</small>` : (rawOutputExcerpt ? `<button class="btn btn-xs btn-outline-secondary view-output-btn" data-job='${JSON.stringify(job).replace(/'/g, "&apos;")}' data-machine="${escapeHtml(job.machine)}">View Output</button>` : 'N/A');
                             
                             if (isSuccessfulStatus && job.failed_updates_in_job > 0) {
                                 statusClass = 'job-status-failed'; 
@@ -304,11 +309,73 @@
             }
             
             $('body').on('click', '.view-output-btn', function() {
-                const outputData = $(this).data('output');
+                const jobData = $(this).data('job');
                 const machineName = $(this).data('machine');
                 
                 $('#outputMachine').text(machineName || 'Unknown');
-                $('#outputContent').val(outputData || 'No output available');
+                
+                let formattedOutput = '';
+                
+                if (jobData && jobData.results) {
+                    const results = jobData.results;
+                    
+                    formattedOutput += `=== PATCH STATUS SUMMARY ===\n`;
+                    formattedOutput += `Machine: ${jobData.machine || 'Unknown'}\n`;
+                    formattedOutput += `Execution Status: ${results.executionStatus || 'Unknown'}\n`;
+                    formattedOutput += `Total Updates Found: ${results.totalUpdates || 0}\n`;
+                    formattedOutput += `Failed Updates: ${results.failedUpdates ? results.failedUpdates.length : 0}\n`;
+                    formattedOutput += `Timestamp: ${results.timestampUTC || 'Unknown'}\n\n`;
+                    
+                    if (results.updateHistory && results.updateHistory.length > 0) {
+                        formattedOutput += `=== UPDATE HISTORY ===\n`;
+                        results.updateHistory.forEach((update, index) => {
+                            if (typeof update === 'object') {
+                                formattedOutput += `${index + 1}. ${update.Title || update.UpdateKB || 'Unknown Update'}\n`;
+                                formattedOutput += `   KB: ${update.UpdateKB || 'N/A'}\n`;
+                                formattedOutput += `   Status: ${update.Status || 'Unknown'}\n`;
+                                formattedOutput += `   Operation: ${update.Operation || 'N/A'}\n`;
+                                if (update.Date) formattedOutput += `   Date: ${update.Date}\n`;
+                                formattedOutput += `\n`;
+                            } else {
+                                formattedOutput += `${index + 1}. ${update}\n`;
+                            }
+                        });
+                    }
+                    
+                    if (results.failedUpdates && results.failedUpdates.length > 0) {
+                        formattedOutput += `\n=== FAILED UPDATES DETAILS ===\n`;
+                        results.failedUpdates.forEach((failed, index) => {
+                            formattedOutput += `${index + 1}. ${failed.Title || failed.UpdateKB || 'Unknown Failed Update'}\n`;
+                            formattedOutput += `   KB: ${failed.UpdateKB || 'N/A'}\n`;
+                            formattedOutput += `   Status: ${failed.Status || 'Failed'}\n`;
+                            formattedOutput += `   Operation: ${failed.Operation || 'N/A'}\n`;
+                            if (failed.Date) formattedOutput += `   Date: ${failed.Date}\n`;
+                            formattedOutput += `\n`;
+                        });
+                    }
+                    
+                    if (results.diagnosticChecks && Object.keys(results.diagnosticChecks).length > 0) {
+                        formattedOutput += `\n=== DIAGNOSTIC CHECKS ===\n`;
+                        for (const [check, result] of Object.entries(results.diagnosticChecks)) {
+                            formattedOutput += `${check}: ${result}\n`;
+                        }
+                        formattedOutput += `\n`;
+                    }
+                    
+                    if (results.errorMessage) {
+                        formattedOutput += `\n=== ERROR MESSAGE ===\n`;
+                        formattedOutput += `${results.errorMessage}\n\n`;
+                    }
+                    
+                    if (results.rawOutputExcerpt) {
+                        formattedOutput += `\n=== RAW OUTPUT EXCERPT ===\n`;
+                        formattedOutput += `${results.rawOutputExcerpt}\n`;
+                    }
+                } else {
+                    formattedOutput = 'No detailed output available for this job.';
+                }
+                
+                $('#outputContent').val(formattedOutput);
                 $('#outputModal').modal('show');
             });
             
